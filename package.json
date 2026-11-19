@@ -1,0 +1,11 @@
+{
+  "name": "snn-wallet-web",
+  "version": "0.1.0",
+  "description": "Testnet web wallet for SmartNode Network (SNN). Prototype, not for real funds.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "test": "node --test tests/ledger.test.js tests/keystore.test.js"
+  }
+}

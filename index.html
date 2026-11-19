@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="محفظة SNN التجريبية لشبكة SmartNode: إنشاء محفظة، عرض الرصيد، إرسال واستقبال النقاط.">
+  <meta name="theme-color" content="#070b16">
+  <title>SNN Wallet · محفظة SmartNode</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+  <script type="module" src="js/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">S</span>
+      <div>
+        <strong>SNN Wallet</strong>
+        <small>SmartNode Network</small>
+      </div>
+    </div>
+    <span class="badge">Testnet · تجريبي</span>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">شبكة لامركزية · Android أولاً</p>
+        <h1>محفظتك الرقمية لنقاط SNN</h1>
+        <p class="lead">
+          أنشئ محفظتك في المتصفح، وأرسل النقاط واستقبلها، وتابع سجل تحويلاتك.
+          هذه نسخة تجريبية على شبكة اختبار محلية، ولا تمثل أصولاً ذات قيمة حقيقية.
+        </p>
+        <ul class="features">
+          <li>مفتاحك الخاص مشفّر بكلمة مرور لا تُرسل إلى أي خادم</li>
+          <li>حماية من إعادة تنفيذ المعاملات عبر رقم المعاملة (nonce)</li>
+          <li>رصيد دقيق حتى الجزء من مليون من SNN بدون أخطاء الكسور العشرية</li>
+        </ul>
+      </div>
+
+      <div class="card-stack">
+        <!-- Onboarding: no wallet yet -->
+        <section id="view-onboarding" class="card" hidden aria-labelledby="onboarding-title">
+          <h2 id="onboarding-title">إنشاء محفظة جديدة</h2>
+          <p class="muted">اختر كلمة مرور قوية. لا يمكن استرجاعها إذا نسيتها.</p>
+          <form id="create-form" class="stack" novalidate>
+            <label>
+              كلمة المرور (10 أحرف على الأقل)
+              <input name="passphrase" type="password" autocomplete="new-password" minlength="10" required>
+            </label>
+            <label>
+              تأكيد كلمة المرور
+              <input name="confirm" type="password" autocomplete="new-password" minlength="10" required>
+            </label>
+            <button class="primary" type="submit">إنشاء المحفظة</button>
+            <p class="form-msg" role="alert"></p>
+          </form>
+          <p class="note">عند الإنشاء ستحصل على 100 SNN تجريبية من صنبور الاختبار. لا قيمة مالية لها.</p>
+        </section>
+
+        <!-- Unlock: wallet exists but is locked -->
+        <section id="view-unlock" class="card" hidden aria-labelledby="unlock-title">
+          <h2 id="unlock-title">فتح المحفظة</h2>
+          <p class="muted">أدخل كلمة المرور لفك تشفير مفتاحك في هذه الجلسة.</p>
+          <form id="unlock-form" class="stack" novalidate>
+            <label>
+              كلمة المرور
+              <input name="passphrase" type="password" autocomplete="current-password" required>
+            </label>
+            <button class="primary" type="submit">فتح</button>
+            <p class="form-msg" role="alert"></p>
+          </form>
+        </section>
+
+        <!-- Dashboard: wallet unlocked -->
+        <section id="view-dashboard" class="dashboard" hidden aria-label="لوحة المحفظة">
+          <div class="card balance-card">
+            <p class="muted">الرصيد المتاح</p>
+            <p class="balance"><span id="balance">0</span><span class="unit">SNN</span></p>
+            <p class="muted">عنوان محفظتك</p>
+            <div class="address-row">
+              <code id="address" dir="ltr"></code>
+              <button id="copy-address" class="ghost" type="button">نسخ</button>
+            </div>
+            <div class="actions">
+              <button id="lock" class="ghost" type="button">قفل المحفظة</button>
+              <button id="export" class="ghost" type="button">تنزيل الملف المشفّر</button>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <form id="send-form" class="card stack" novalidate>
+              <h2>إرسال SNN</h2>
+              <label>
+                عنوان المستلم
+                <input name="to" dir="ltr" autocomplete="off" spellcheck="false" placeholder="snn1…" required>
+              </label>
+              <label>
+                المبلغ (SNN)
+                <input name="amount" dir="ltr" inputmode="decimal" autocomplete="off" placeholder="0.000001" required>
+              </label>
+              <button class="primary" type="submit">إرسال النقاط</button>
+              <p class="form-msg" role="alert"></p>
+            </form>
+
+            <section class="card">
+              <h2>استقبال SNN</h2>
+              <p class="muted">شارك هذا العنوان مع المرسل. العنوان نفسه آمن للمشاركة.</p>
+              <div class="address-row">
+                <code id="receive-address" dir="ltr"></code>
+              </div>
+            </section>
+          </div>
+
+          <section class="card">
+            <div class="row-between">
+              <h2>سجل المعاملات</h2>
+              <span id="height" class="muted"></span>
+            </div>
+            <ul id="history" class="history" aria-live="polite"></ul>
+            <p id="history-empty" class="muted">لا توجد معاملات بعد.</p>
+          </section>
+
+          <details class="danger">
+            <summary>إعادة ضبط المحفظة على هذا المتصفح</summary>
+            <p>يحذف هذا كل البيانات المحلية، بما فيها الملف المشفّر. إذا لم تحفظ نسخة منه، فلن تتمكن من الوصول إلى المحفظة.</p>
+            <button id="reset" class="danger-btn" type="button">حذف المحفظة نهائياً</button>
+          </details>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

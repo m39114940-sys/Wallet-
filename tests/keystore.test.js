@@ -5,6 +5,7 @@ import {
   deriveAddress,
   encryptKeystore,
   decryptKeystore,
+  parseKeystoreFile,
   toHex,
   fromHex,
 } from "../js/keystore.js";
@@ -73,4 +74,22 @@ test("a keystore with weak KDF iterations is refused", async () => {
 test("fromHex rejects malformed input", () => {
   assert.throws(() => fromHex("xyz"));
   assert.throws(() => fromHex("abc"));
+});
+
+test("parseKeystoreFile accepts a valid keystore and returns it unchanged", async () => {
+  const key = createPrivateKey();
+  const address = await deriveAddress(key);
+  const keystore = await encryptKeystore(key, "right-passphrase", address, TEST_ITERATIONS);
+  assert.deepEqual(parseKeystoreFile(JSON.stringify(keystore)), keystore);
+});
+
+test("parseKeystoreFile rejects non-JSON, wrong format, bad address and oversized files", async () => {
+  assert.throws(() => parseKeystoreFile("not json"), /ليس JSON/);
+  assert.throws(() => parseKeystoreFile(JSON.stringify({ format: "other" })), /لا يطابق صيغة SNN/);
+  assert.throws(
+    () => parseKeystoreFile(JSON.stringify({ format: "snn-keystore", version: 1, address: "bad", kdf: {}, cipher: {} })),
+    /لا يطابق صيغة SNN/,
+  );
+  assert.throws(() => parseKeystoreFile("x".repeat(30_000)), /كبير الحجم/);
+  assert.throws(() => parseKeystoreFile(""), /كبير الحجم|غير صالح/);
 });

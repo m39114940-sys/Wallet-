@@ -342,6 +342,26 @@ button:focus-visible { outline: 3px solid rgba(45, 212, 191, 0.5); outline-offse
   border: 1px solid rgba(246, 192, 89, 0.25);
 }
 
+.confirm {
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(246, 192, 89, 0.08);
+  border: 1px solid rgba(246, 192, 89, 0.3);
+}
+
+.confirm p { margin: 0 0 12px; font-size: 0.95rem; overflow-wrap: anywhere; }
+.confirm .actions button { flex: 1 1 120px; }
+
+.restore {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.restore summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.restore form { margin-top: 14px; }
+.restore .muted { margin: 12px 0 0; }
+
 /* Toast */
 .toast {
   position: fixed;

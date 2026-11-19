@@ -58,6 +58,23 @@
             <p class="form-msg" role="alert"></p>
           </form>
           <p class="note">عند الإنشاء ستحصل على 100 SNN تجريبية من صنبور الاختبار. لا قيمة مالية لها.</p>
+
+          <details class="restore">
+            <summary>لدي ملف محفظة مشفّر، أريد استعادتها</summary>
+            <form id="restore-form" class="stack" novalidate>
+              <label>
+                ملف المحفظة (.json)
+                <input name="file" type="file" accept="application/json,.json" required>
+              </label>
+              <label>
+                كلمة المرور
+                <input name="passphrase" type="password" autocomplete="current-password" required>
+              </label>
+              <button class="ghost" type="submit">استعادة المحفظة</button>
+              <p class="form-msg" role="alert"></p>
+            </form>
+            <p class="muted">الرصيد يُحسب من سجل المتصفح، لذلك قد يظهر 0 إذا استعدت المحفظة على متصفح جديد.</p>
+          </details>
         </section>
 
         <!-- Unlock: wallet exists but is locked -->
@@ -101,7 +118,14 @@
                 المبلغ (SNN)
                 <input name="amount" dir="ltr" inputmode="decimal" autocomplete="off" placeholder="0.000001" required>
               </label>
-              <button class="primary" type="submit">إرسال النقاط</button>
+              <button id="send-submit" class="primary" type="submit">مراجعة الإرسال</button>
+              <div id="send-confirm" class="confirm" hidden>
+                <p id="send-confirm-text" role="status"></p>
+                <div class="actions">
+                  <button id="send-yes" class="primary" type="button">تأكيد الإرسال</button>
+                  <button id="send-no" class="ghost" type="button">إلغاء</button>
+                </div>
+              </div>
               <p class="form-msg" role="alert"></p>
             </form>
 

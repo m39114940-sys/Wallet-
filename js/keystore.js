@@ -4,8 +4,11 @@
 // Limitation: addresses are derived with SHA-256 over the private key. This is a demo derivation,
 // not the Ed25519 public-key scheme that the SNN spec requires. Signing is not implemented yet.
 
+import { isValidAddress } from "./ledger.js";
+
 const PBKDF2_ITERATIONS = 600_000;
 const ADDRESS_DOMAIN = "SNN-DEMO-ADDRESS-v1";
+const MAX_KEYSTORE_BYTES = 20_000;
 const encoder = new TextEncoder();
 
 export const toHex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -53,6 +56,33 @@ export async function encryptKeystore(privateKey, passphrase, address, iteration
     kdf: { name: "PBKDF2", hash: "SHA-256", iterations, salt: toHex(salt) },
     cipher: { name: "AES-256-GCM", iv: toHex(iv), data: toHex(cipher) },
   };
+}
+
+// Checks the shape of an uploaded keystore file before any decryption is attempted.
+export function parseKeystoreFile(text) {
+  if (typeof text !== "string" || text.length === 0 || text.length > MAX_KEYSTORE_BYTES) {
+    throw new Error("ملف المحفظة غير صالح أو كبير الحجم.");
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("ملف المحفظة ليس JSON صالحاً.");
+  }
+  const shapeOk =
+    data &&
+    data.format === "snn-keystore" &&
+    data.version === 1 &&
+    isValidAddress(data.address) &&
+    data.kdf &&
+    typeof data.kdf.salt === "string" &&
+    data.cipher &&
+    typeof data.cipher.iv === "string" &&
+    typeof data.cipher.data === "string";
+  if (!shapeOk) {
+    throw new Error("ملف المحفظة لا يطابق صيغة SNN.");
+  }
+  return data;
 }
 
 // Throws a generic error for both a wrong passphrase and a tampered file, so the failure reveals nothing extra.

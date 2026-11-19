@@ -1,5 +1,11 @@
-import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, formatAmount } from "./ledger.js";
-import { createPrivateKey, deriveAddress, encryptKeystore, decryptKeystore } from "./keystore.js";
+import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, formatAmount, parseAmount, isValidAddress } from "./ledger.js";
+import {
+  createPrivateKey,
+  deriveAddress,
+  encryptKeystore,
+  decryptKeystore,
+  parseKeystoreFile,
+} from "./keystore.js";
 
 const LEDGER_KEY = "snn.demo.ledger.v1";
 const KEYSTORE_KEY = "snn.demo.keystore.v1";
@@ -16,6 +22,7 @@ const views = {
 // The ledger is the testnet state kept in localStorage. The private key lives only in memory for the session.
 let ledger = loadLedger();
 let session = null; // { address, privateKey }
+let pendingSend = null; // { to, amount } waiting for user confirmation
 
 // ---------- Storage helpers (storage can be disabled in private mode) ----------
 
@@ -146,8 +153,72 @@ function showDashboard() {
 
 function start() {
   session = null;
+  cancelPendingSend();
   const hasWallet = Boolean(readStorage(KEYSTORE_KEY));
   showView(hasWallet ? "unlock" : "onboarding");
+}
+
+// ---------- Send confirmation ----------
+
+function cancelPendingSend() {
+  pendingSend = null;
+  $("#send-confirm").hidden = true;
+  $("#send-submit").hidden = false;
+}
+
+// Validates the form against the ledger before asking for confirmation, so the user never confirms an impossible transfer.
+function reviewSend(form) {
+  const to = form.to.value.trim();
+  const amountText = form.amount.value.trim();
+
+  if (!isValidAddress(to)) return setMessage(form, "عنوان المستلم غير صالح.");
+  if (to === session.address) return setMessage(form, "لا يمكن الإرسال إلى المحفظة نفسها.");
+
+  let units;
+  try {
+    units = parseAmount(amountText);
+  } catch (err) {
+    return setMessage(form, err.message);
+  }
+  if (ledger.balanceOf(session.address) < units) {
+    return setMessage(form, "الرصيد غير كافٍ لإتمام التحويل.");
+  }
+
+  pendingSend = { to, amount: amountText };
+  setMessage(form);
+  $("#send-confirm-text").textContent = `إرسال ${formatAmount(units)} SNN إلى ${shortAddress(to)}؟ لا يمكن التراجع عن التحويل بعد تأكيده.`;
+  $("#send-confirm").hidden = false;
+  $("#send-submit").hidden = true;
+}
+
+function executeSend(form) {
+  if (!session || !pendingSend) return;
+  const { to, amount } = pendingSend;
+
+  // Re-read the stored state, so the nonce and balance reflect any other tab that changed them.
+  ledger = loadLedger();
+  try {
+    const tx = ledger.transfer({ from: session.address, to, amount, nonce: ledger.nextNonce(session.address) });
+    const saved = saveLedger();
+    cancelPendingSend();
+    form.reset();
+    setMessage(form);
+    renderDashboard();
+    toast(
+      saved
+        ? `تم إرسال ${formatAmount(tx.amount)} SNN (المعاملة #${tx.height})`
+        : "تم التحويل في هذه الجلسة، لكن تعذّر حفظه في المتصفح",
+      saved ? "ok" : "error",
+    );
+  } catch (err) {
+    cancelPendingSend();
+    if (err instanceof LedgerError) {
+      setMessage(form, err.message);
+    } else {
+      console.error(err);
+      setMessage(form, "حدث خطأ غير متوقع أثناء الإرسال.");
+    }
+  }
 }
 
 // ---------- Handlers ----------
@@ -192,6 +263,35 @@ $("#create-form").addEventListener("submit", async (event) => {
   }
 });
 
+$("#restore-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const file = form.file.files[0];
+  const passphrase = form.passphrase.value;
+  if (!file) {
+    setMessage(form, "اختر ملف المحفظة أولاً.");
+    return;
+  }
+
+  setBusy(form, true);
+  try {
+    const keystore = parseKeystoreFile(await file.text());
+    const { privateKey, address } = await decryptKeystore(keystore, passphrase);
+    if (!writeStorage(KEYSTORE_KEY, JSON.stringify(keystore))) {
+      throw new Error("storage");
+    }
+    session = { address, privateKey };
+    form.reset();
+    setMessage(form);
+    showDashboard();
+    toast("تمت استعادة المحفظة", "ok");
+  } catch (err) {
+    setMessage(form, err.message || "تعذّر استعادة المحفظة.");
+  } finally {
+    setBusy(form, false);
+  }
+});
+
 $("#unlock-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -218,36 +318,23 @@ $("#unlock-form").addEventListener("submit", async (event) => {
   }
 });
 
-$("#send-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  if (!session) return;
+const sendForm = $("#send-form");
 
-  try {
-    const tx = ledger.transfer({
-      from: session.address,
-      to: form.to.value.trim(),
-      amount: form.amount.value.trim(),
-      nonce: ledger.nextNonce(session.address),
-    });
-    const saved = saveLedger();
-    form.reset();
-    setMessage(form);
-    renderDashboard();
-    toast(
-      saved
-        ? `تم إرسال ${formatAmount(tx.amount)} SNN (المعاملة #${tx.height})`
-        : "تم التحويل في هذه الجلسة، لكن تعذّر حفظه في المتصفح",
-      saved ? "ok" : "error",
-    );
-  } catch (err) {
-    if (err instanceof LedgerError) {
-      setMessage(form, err.message);
-    } else {
-      console.error(err);
-      setMessage(form, "حدث خطأ غير متوقع أثناء الإرسال.");
-    }
-  }
+sendForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!session) return;
+  reviewSend(sendForm);
+});
+
+// Editing the fields after a review invalidates that review.
+sendForm.addEventListener("input", () => {
+  if (pendingSend) cancelPendingSend();
+});
+
+$("#send-yes").addEventListener("click", () => executeSend(sendForm));
+$("#send-no").addEventListener("click", () => {
+  cancelPendingSend();
+  setMessage(sendForm);
 });
 
 $("#copy-address").addEventListener("click", async () => {
@@ -262,6 +349,7 @@ $("#copy-address").addEventListener("click", async () => {
 
 $("#lock").addEventListener("click", () => {
   session = null;
+  cancelPendingSend();
   $("#unlock-form").reset();
   setMessage($("#unlock-form"));
   showView("unlock");
@@ -292,6 +380,17 @@ $("#reset").addEventListener("click", () => {
   ledger = new Ledger();
   start();
   toast("تم حذف المحفظة من هذا المتصفح", "ok");
+});
+
+// Keeps other open tabs in sync: new transfers appear here, and a reset in one tab locks the rest.
+window.addEventListener("storage", (event) => {
+  if (event.key === LEDGER_KEY && session) {
+    ledger = loadLedger();
+    renderDashboard();
+  } else if (event.key === KEYSTORE_KEY && !event.newValue && session) {
+    start();
+    toast("تم حذف المحفظة من تبويب آخر", "error");
+  }
 });
 
 start();

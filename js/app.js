@@ -1,14 +1,9 @@
 import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, formatAmount, parseAmount, isValidAddress } from "./ledger.js";
-import {
-  createPrivateKey,
-  deriveAddress,
-  encryptKeystore,
-  decryptKeystore,
-  parseKeystoreFile,
-} from "./keystore.js";
+import { createKeystore, unlockKeystore, parseKeystoreFile, MAX_PASSPHRASE_LENGTH } from "./keystore.js";
+import { assertEd25519Support, importSigningKey, signTransfer, toHex } from "./signing.js";
 
-const LEDGER_KEY = "snn.demo.ledger.v1";
-const KEYSTORE_KEY = "snn.demo.keystore.v1";
+const LEDGER_KEY = "snn.demo.ledger.v2";
+const KEYSTORE_KEY = "snn.demo.keystore.v2";
 const MIN_PASSPHRASE_LENGTH = 10;
 
 const $ = (selector) => document.querySelector(selector);
@@ -19,9 +14,9 @@ const views = {
   dashboard: $("#view-dashboard"),
 };
 
-// The ledger is the testnet state kept in localStorage. The private key lives only in memory for the session.
-let ledger = loadLedger();
-let session = null; // { address, privateKey }
+// The ledger is the testnet state kept in localStorage. Private keys live only in memory for the session.
+let ledger = new Ledger();
+let session = null; // { address, signingKey (non-extractable CryptoKey), publicKey (hex) }
 let pendingSend = null; // { to, amount } waiting for user confirmation
 
 // ---------- Storage helpers (storage can be disabled in private mode) ----------
@@ -51,14 +46,17 @@ function removeStorage(key) {
   }
 }
 
-function loadLedger() {
+// Loads and fully verifies the stored ledger. A tampered ledger throws and is never silently replaced.
+async function loadLedger() {
   const raw = readStorage(LEDGER_KEY);
   if (!raw) return new Ledger();
+  let snapshot;
   try {
-    return new Ledger(JSON.parse(raw));
+    snapshot = JSON.parse(raw);
   } catch {
-    return new Ledger();
+    throw new LedgerError("LEDGER_CORRUPT", "سجل المحفظة تالف.");
   }
+  return Ledger.fromSnapshot(snapshot);
 }
 
 function saveLedger() {
@@ -151,12 +149,27 @@ function showDashboard() {
   renderDashboard();
 }
 
+// Removes the displayed backup text, so it does not stay on screen after the wallet is locked.
+function hideBackup() {
+  $("#backup").hidden = true;
+  $("#backup-text").value = "";
+}
+
 function start() {
   session = null;
   cancelPendingSend();
   hideBackup();
   const hasWallet = Boolean(readStorage(KEYSTORE_KEY));
   showView(hasWallet ? "unlock" : "onboarding");
+}
+
+function resetWallet() {
+  if (!window.confirm("سيتم حذف المحفظة وكل سجلها من هذا المتصفح. هل أنت متأكد؟")) return;
+  removeStorage(KEYSTORE_KEY);
+  removeStorage(LEDGER_KEY);
+  ledger = new Ledger();
+  start();
+  toast("تم حذف المحفظة من هذا المتصفح", "ok");
 }
 
 // ---------- Send confirmation ----------
@@ -167,8 +180,8 @@ function cancelPendingSend() {
   $("#send-submit").hidden = false;
 }
 
-// Validates the form against the ledger before asking for confirmation, so the user never confirms an impossible transfer.
-function reviewSend(form) {
+// Validates against the verified ledger before asking for confirmation, so an impossible transfer is never confirmed.
+async function reviewSend(form) {
   const to = form.to.value.trim();
   const amountText = form.amount.value.trim();
 
@@ -178,6 +191,12 @@ function reviewSend(form) {
   let units;
   try {
     units = parseAmount(amountText);
+  } catch (err) {
+    return setMessage(form, err.message);
+  }
+
+  try {
+    ledger = await loadLedger();
   } catch (err) {
     return setMessage(form, err.message);
   }
@@ -192,14 +211,31 @@ function reviewSend(form) {
   $("#send-submit").hidden = true;
 }
 
-function executeSend(form) {
+// Signs in the browser with the session key, then the ledger verifies the signature, nonce and balance.
+async function executeSend(form) {
   if (!session || !pendingSend) return;
   const { to, amount } = pendingSend;
+  const confirmButton = $("#send-yes");
+  confirmButton.disabled = true;
 
-  // Re-read the stored state, so the nonce and balance reflect any other tab that changed them.
-  ledger = loadLedger();
   try {
-    const tx = ledger.transfer({ from: session.address, to, amount, nonce: ledger.nextNonce(session.address) });
+    ledger = await loadLedger();
+    const units = parseAmount(amount);
+    const nonce = ledger.nextNonce(session.address);
+    const signature = await signTransfer(session.signingKey, {
+      from: session.address,
+      to,
+      units: units.toString(),
+      nonce,
+    });
+    const tx = await ledger.transfer({
+      from: session.address,
+      to,
+      amount: units,
+      nonce,
+      publicKey: session.publicKey,
+      signature,
+    });
     const saved = saveLedger();
     cancelPendingSend();
     form.reset();
@@ -219,6 +255,8 @@ function executeSend(form) {
       console.error(err);
       setMessage(form, "حدث خطأ غير متوقع أثناء الإرسال.");
     }
+  } finally {
+    confirmButton.disabled = false;
   }
 }
 
@@ -234,6 +272,10 @@ $("#create-form").addEventListener("submit", async (event) => {
     setMessage(form, `كلمة المرور يجب ألا تقل عن ${MIN_PASSPHRASE_LENGTH} أحرف.`);
     return;
   }
+  if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
+    setMessage(form, "كلمة المرور طويلة جداً.");
+    return;
+  }
   if (passphrase !== repeat) {
     setMessage(form, "كلمتا المرور غير متطابقتين.");
     return;
@@ -241,24 +283,31 @@ $("#create-form").addEventListener("submit", async (event) => {
 
   setBusy(form, true);
   try {
-    const privateKey = createPrivateKey();
-    const address = await deriveAddress(privateKey);
-    const keystore = await encryptKeystore(privateKey, passphrase, address);
+    await assertEd25519Support();
+    const { keystore, privateKeyDer } = await createKeystore(passphrase);
+    const signingKey = await importSigningKey(privateKeyDer);
+    privateKeyDer.fill(0);
 
     if (!writeStorage(KEYSTORE_KEY, JSON.stringify(keystore))) {
       throw new Error("storage");
     }
-    ledger.credit(address, TESTNET_FAUCET_UNITS);
+    ledger = await loadLedger().catch(() => new Ledger());
+    ledger.credit(keystore.address, TESTNET_FAUCET_UNITS);
     saveLedger();
 
-    session = { address, privateKey };
+    session = { address: keystore.address, signingKey, publicKey: keystore.publicKey };
     form.reset();
     setMessage(form);
     showDashboard();
     toast("تم إنشاء المحفظة وإيداع 100 SNN تجريبية", "ok");
   } catch (err) {
     console.error(err);
-    setMessage(form, "تعذّر إنشاء المحفظة في هذا المتصفح. تأكد من السماح بالتخزين المحلي وحاول مرة أخرى.");
+    setMessage(
+      form,
+      err.message && err.message.includes("Ed25519")
+        ? err.message
+        : "تعذّر إنشاء المحفظة في هذا المتصفح. تأكد من السماح بالتخزين المحلي وحاول مرة أخرى.",
+    );
   } finally {
     setBusy(form, false);
   }
@@ -276,17 +325,20 @@ $("#restore-form").addEventListener("submit", async (event) => {
 
   setBusy(form, true);
   try {
+    await assertEd25519Support();
     const keystore = parseKeystoreFile(await file.text());
-    const { privateKey, address } = await decryptKeystore(keystore, passphrase);
+    const unlocked = await unlockKeystore(keystore, passphrase);
+    ledger = await loadLedger();
     if (!writeStorage(KEYSTORE_KEY, JSON.stringify(keystore))) {
       throw new Error("storage");
     }
-    session = { address, privateKey };
+    session = { address: unlocked.address, signingKey: unlocked.signingKey, publicKey: toHex(unlocked.publicKey) };
     form.reset();
     setMessage(form);
     showDashboard();
     toast("تمت استعادة المحفظة", "ok");
   } catch (err) {
+    session = null;
     setMessage(form, err.message || "تعذّر استعادة المحفظة.");
   } finally {
     setBusy(form, false);
@@ -298,21 +350,18 @@ $("#unlock-form").addEventListener("submit", async (event) => {
   const form = event.currentTarget;
   const passphrase = form.passphrase.value;
 
-  let keystore = null;
-  try {
-    keystore = JSON.parse(readStorage(KEYSTORE_KEY) ?? "null");
-  } catch {
-    keystore = null;
-  }
-
   setBusy(form, true);
   try {
-    const { privateKey, address } = await decryptKeystore(keystore, passphrase);
-    session = { address, privateKey };
+    await assertEd25519Support();
+    const keystore = parseKeystoreFile(readStorage(KEYSTORE_KEY) ?? "");
+    const unlocked = await unlockKeystore(keystore, passphrase);
+    ledger = await loadLedger();
+    session = { address: unlocked.address, signingKey: unlocked.signingKey, publicKey: toHex(unlocked.publicKey) };
     form.reset();
     setMessage(form);
     showDashboard();
   } catch (err) {
+    session = null;
     setMessage(form, err.message || "تعذّر فتح المحفظة.");
   } finally {
     setBusy(form, false);
@@ -321,10 +370,10 @@ $("#unlock-form").addEventListener("submit", async (event) => {
 
 const sendForm = $("#send-form");
 
-sendForm.addEventListener("submit", (event) => {
+sendForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!session) return;
-  reviewSend(sendForm);
+  await reviewSend(sendForm);
 });
 
 // Editing the fields after a review invalidates that review.
@@ -348,12 +397,6 @@ $("#copy-address").addEventListener("click", async () => {
   }
 });
 
-// Removes the displayed backup text, so it does not stay on screen after the wallet is locked.
-function hideBackup() {
-  $("#backup").hidden = true;
-  $("#backup-text").value = "";
-}
-
 $("#lock").addEventListener("click", () => {
   session = null;
   cancelPendingSend();
@@ -364,7 +407,7 @@ $("#lock").addEventListener("click", () => {
   toast("تم قفل المحفظة", "ok");
 });
 
-// Shows the already-encrypted keystore as text. The plaintext key is never exported.
+// Shows the already-encrypted keystore as text. The private key is never exported.
 // Text is used instead of a file download, because published pages cannot trigger downloads.
 $("#export").addEventListener("click", () => {
   const raw = readStorage(KEYSTORE_KEY);
@@ -372,10 +415,14 @@ $("#export").addEventListener("click", () => {
     toast("لا يوجد ملف محفظة لعرضه.", "error");
     return;
   }
-  const panel = $("#backup");
   const text = $("#backup-text");
-  text.value = JSON.stringify(JSON.parse(raw), null, 2);
-  panel.hidden = false;
+  try {
+    text.value = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    toast("ملف المحفظة تالف.", "error");
+    return;
+  }
+  $("#backup").hidden = false;
   text.focus();
   text.select();
 });
@@ -392,20 +439,18 @@ $("#copy-backup").addEventListener("click", async () => {
   }
 });
 
-$("#reset").addEventListener("click", () => {
-  if (!window.confirm("سيتم حذف المحفظة وكل سجلها من هذا المتصفح. هل أنت متأكد؟")) return;
-  removeStorage(KEYSTORE_KEY);
-  removeStorage(LEDGER_KEY);
-  ledger = new Ledger();
-  start();
-  toast("تم حذف المحفظة من هذا المتصفح", "ok");
-});
+$("#reset").addEventListener("click", resetWallet);
+$("#reset-locked").addEventListener("click", resetWallet);
 
-// Keeps other open tabs in sync: new transfers appear here, and a reset in one tab locks the rest.
-window.addEventListener("storage", (event) => {
+// Keeps other open tabs in sync. Each change is re-verified before it is shown.
+window.addEventListener("storage", async (event) => {
   if (event.key === LEDGER_KEY && session) {
-    ledger = loadLedger();
-    renderDashboard();
+    try {
+      ledger = await loadLedger();
+      renderDashboard();
+    } catch (err) {
+      toast(err.message, "error");
+    }
   } else if (event.key === KEYSTORE_KEY && !event.newValue && session) {
     start();
     toast("تم حذف المحفظة من تبويب آخر", "error");

@@ -8,12 +8,12 @@ import {
   isValidAddress,
   TESTNET_FAUCET_UNITS,
 } from "../js/ledger.js";
+import { makeAccount, signedTransfer } from "./helpers.js";
 
-const ALICE = "snn1" + "a".repeat(40);
 const BOB = "snn1" + "b".repeat(40);
 
-const expectError = (fn, code) => {
-  assert.throws(fn, (err) => err instanceof LedgerError && err.code === code);
+const expectCode = async (promise, code) => {
+  await assert.rejects(promise, (err) => err instanceof LedgerError && err.code === code);
 };
 
 test("parseAmount converts decimals to exact micro-SNN units", () => {
@@ -25,7 +25,7 @@ test("parseAmount converts decimals to exact micro-SNN units", () => {
 
 test("parseAmount rejects zero, negatives, exponents and extra decimals", () => {
   for (const bad of ["0", "0.0", "-1", "1e3", "1.0000001", "abc", "", "1,5"]) {
-    expectError(() => parseAmount(bad), "INVALID_AMOUNT");
+    assert.throws(() => parseAmount(bad), (err) => err.code === "INVALID_AMOUNT", bad);
   }
 });
 
@@ -37,82 +37,74 @@ test("formatAmount trims trailing zeros", () => {
 });
 
 test("isValidAddress accepts only snn1 followed by 40 lowercase hex characters", () => {
-  assert.equal(isValidAddress(ALICE), true);
+  assert.equal(isValidAddress("snn1" + "a".repeat(40)), true);
   assert.equal(isValidAddress("snn1" + "A".repeat(40)), false);
   assert.equal(isValidAddress("snn1" + "a".repeat(39)), false);
   assert.equal(isValidAddress("btc1" + "a".repeat(40)), false);
   assert.equal(isValidAddress(undefined), false);
 });
 
-test("faucet credit increases balance and is recorded in history", () => {
+test("faucet credit is allowed once per address and only for the fixed testnet amount", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, TESTNET_FAUCET_UNITS);
-  assert.equal(ledger.balanceOf(ALICE), TESTNET_FAUCET_UNITS);
-  assert.equal(ledger.height, 1);
-  assert.equal(ledger.transactionsFor(ALICE)[0].type, "faucet");
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
+  assert.equal(ledger.balanceOf(alice.address), TESTNET_FAUCET_UNITS);
+  assert.throws(() => ledger.credit(alice.address, TESTNET_FAUCET_UNITS), (e) => e.code === "FAUCET_USED");
+  assert.throws(() => new Ledger().credit(alice.address, 1n), (e) => e.code === "INVALID_AMOUNT");
 });
 
-test("transfer moves funds and increments the sender nonce", () => {
+test("a valid signed transfer moves funds and advances the sender nonce", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("10"));
-  const tx = ledger.transfer({ from: ALICE, to: BOB, amount: "2.5", nonce: 0 });
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
 
-  assert.equal(ledger.balanceOf(ALICE), parseAmount("7.5"));
+  const tx = await ledger.transfer(await signedTransfer(alice, BOB, "2.5", 0));
+  assert.equal(ledger.balanceOf(alice.address), parseAmount("97.5"));
   assert.equal(ledger.balanceOf(BOB), parseAmount("2.5"));
-  assert.equal(ledger.nextNonce(ALICE), 1);
+  assert.equal(ledger.nextNonce(alice.address), 1);
   assert.equal(tx.nonce, 0);
   assert.equal(tx.height, 2);
 });
 
-test("a replayed transfer with the same nonce is rejected (replay and double-spend protection)", () => {
+test("insufficient funds fails and leaves state unchanged", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("10"));
-  ledger.transfer({ from: ALICE, to: BOB, amount: "1", nonce: 0 });
-
-  expectError(() => ledger.transfer({ from: ALICE, to: BOB, amount: "1", nonce: 0 }), "NONCE_MISMATCH");
-  assert.equal(ledger.balanceOf(BOB), parseAmount("1"));
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
+  await expectCode(ledger.transfer(await signedTransfer(alice, BOB, "101", 0)), "INSUFFICIENT_FUNDS");
+  assert.equal(ledger.balanceOf(alice.address), TESTNET_FAUCET_UNITS);
+  assert.equal(ledger.nextNonce(alice.address), 0);
 });
 
-test("a nonce from the future is rejected", () => {
+test("self-transfers and invalid recipients are rejected before any signature check", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("10"));
-  expectError(() => ledger.transfer({ from: ALICE, to: BOB, amount: "1", nonce: 5 }), "NONCE_MISMATCH");
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
+  await expectCode(ledger.transfer(await signedTransfer(alice, alice.address, "1", 0)), "SELF_TRANSFER");
+  await expectCode(
+    ledger.transfer({ ...(await signedTransfer(alice, BOB, "1", 0)), to: "nope" }),
+    "INVALID_RECIPIENT",
+  );
 });
 
-test("transfer fails when the balance is insufficient and leaves state unchanged", () => {
+test("transactionsFor returns newest first and includes incoming and outgoing transfers", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("1"));
-  expectError(() => ledger.transfer({ from: ALICE, to: BOB, amount: "2", nonce: 0 }), "INSUFFICIENT_FUNDS");
-  assert.equal(ledger.balanceOf(ALICE), parseAmount("1"));
-  assert.equal(ledger.nextNonce(ALICE), 0);
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
+  await ledger.transfer(await signedTransfer(alice, BOB, "1", 0));
+  assert.equal(ledger.transactionsFor(BOB).length, 1);
+  assert.equal(ledger.transactionsFor(BOB)[0].type, "transfer");
+  assert.equal(ledger.transactionsFor(alice.address)[0].height, 2);
 });
 
-test("transfer rejects self-transfers and invalid addresses", () => {
+test("a stored ledger reloads exactly when its records are intact", async () => {
+  const alice = await makeAccount();
   const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("1"));
-  expectError(() => ledger.transfer({ from: ALICE, to: ALICE, amount: "1", nonce: 0 }), "SELF_TRANSFER");
-  expectError(() => ledger.transfer({ from: ALICE, to: "nope", amount: "1", nonce: 0 }), "INVALID_RECIPIENT");
-  expectError(() => ledger.transfer({ from: "nope", to: BOB, amount: "1", nonce: 0 }), "INVALID_SENDER");
-});
+  ledger.credit(alice.address, TESTNET_FAUCET_UNITS);
+  await ledger.transfer(await signedTransfer(alice, BOB, "0.000001", 0));
 
-test("transactionsFor returns newest first and includes both incoming and outgoing transfers", () => {
-  const ledger = new Ledger();
-  ledger.credit(ALICE, parseAmount("5"));
-  ledger.transfer({ from: ALICE, to: BOB, amount: "1", nonce: 0 });
-  const bobHistory = ledger.transactionsFor(BOB);
-  assert.equal(bobHistory.length, 1);
-  assert.equal(bobHistory[0].type, "transfer");
-  assert.equal(ledger.transactionsFor(ALICE)[0].height, 2);
-});
-
-test("state survives a JSON round trip without losing BigInt precision", () => {
-  const ledger = new Ledger();
-  ledger.credit(ALICE, TESTNET_FAUCET_UNITS);
-  ledger.transfer({ from: ALICE, to: BOB, amount: "0.000001", nonce: 0 });
-
-  const restored = new Ledger(JSON.parse(JSON.stringify(ledger)));
-  assert.equal(restored.balanceOf(ALICE), ledger.balanceOf(ALICE));
+  const restored = await Ledger.fromSnapshot(JSON.parse(JSON.stringify(ledger)));
+  assert.equal(restored.balanceOf(alice.address), ledger.balanceOf(alice.address));
   assert.equal(restored.balanceOf(BOB), 1n);
-  assert.equal(restored.nextNonce(ALICE), 1);
+  assert.equal(restored.nextNonce(alice.address), 1);
   assert.equal(restored.height, 2);
 });

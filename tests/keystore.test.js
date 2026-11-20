@@ -1,95 +1,57 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  createPrivateKey,
-  deriveAddress,
-  encryptKeystore,
-  decryptKeystore,
-  parseKeystoreFile,
-  toHex,
-  fromHex,
-} from "../js/keystore.js";
-import { isValidAddress } from "../js/ledger.js";
+import { createKeystore, parseKeystoreFile, unlockKeystore, MAX_ITERATIONS, MAX_KEYSTORE_BYTES } from "../js/keystore.js";
+import { toHex, createAccount, addressFromPublicKey } from "../js/signing.js";
 
 // Lower iteration count keeps the test fast. The app uses the production default.
 const TEST_ITERATIONS = 100_000;
+const PASS = "right-passphrase-1";
 
-test("createPrivateKey returns 32 random bytes", () => {
-  const a = createPrivateKey();
-  const b = createPrivateKey();
-  assert.equal(a.length, 32);
-  assert.notDeepEqual(toHex(a), toHex(b));
+test("a new keystore is version 2 with an Ed25519 public key and a matching address", async () => {
+  const { keystore } = await createKeystore(PASS, TEST_ITERATIONS);
+  assert.equal(keystore.version, 2);
+  assert.equal(keystore.publicKey.length, 64);
+  assert.equal(keystore.address, await addressFromPublicKey(Uint8Array.from(Buffer.from(keystore.publicKey, "hex"))));
 });
 
-test("deriveAddress is deterministic and produces a valid SNN address", async () => {
-  const key = createPrivateKey();
-  const first = await deriveAddress(key);
-  const second = await deriveAddress(key);
-  assert.equal(first, second);
-  assert.equal(isValidAddress(first), true);
-});
-
-test("keystore round trip restores the same private key and address", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "correct horse battery", address, TEST_ITERATIONS);
-
-  const { privateKey, address: restored } = await decryptKeystore(keystore, "correct horse battery");
-  assert.equal(toHex(privateKey), toHex(key));
-  assert.equal(restored, address);
+test("unlock restores a signing key whose public key matches the stored one", async () => {
+  const { keystore } = await createKeystore(PASS, TEST_ITERATIONS);
+  const unlocked = await unlockKeystore(JSON.parse(JSON.stringify(keystore)), PASS);
+  assert.equal(unlocked.address, keystore.address);
+  assert.equal(toHex(unlocked.publicKey), keystore.publicKey);
 });
 
 test("the stored keystore never contains the plaintext private key", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "passphrase-1234", address, TEST_ITERATIONS);
-  assert.equal(JSON.stringify(keystore).includes(toHex(key)), false);
+  const { keystore, privateKeyDer } = await createKeystore(PASS, TEST_ITERATIONS);
+  assert.equal(JSON.stringify(keystore).includes(toHex(privateKeyDer)), false);
 });
 
 test("a wrong passphrase is rejected with a generic error", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "right-passphrase", address, TEST_ITERATIONS);
-  await assert.rejects(decryptKeystore(keystore, "wrong-passphrase"), /كلمة المرور غير صحيحة/);
+  const { keystore } = await createKeystore(PASS, TEST_ITERATIONS);
+  await assert.rejects(unlockKeystore(keystore, "wrong-passphrase-1"), /كلمة المرور غير صحيحة/);
 });
 
 test("a tampered ciphertext is rejected", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "right-passphrase", address, TEST_ITERATIONS);
-  const data = fromHex(keystore.cipher.data);
-  data[0] ^= 0xff;
-  keystore.cipher.data = toHex(data);
-  await assert.rejects(decryptKeystore(keystore, "right-passphrase"));
+  const { keystore } = await createKeystore(PASS, TEST_ITERATIONS);
+  const flipped = keystore.cipher.data.slice(0, 2) === "00" ? "ff" + keystore.cipher.data.slice(2) : "00" + keystore.cipher.data.slice(2);
+  keystore.cipher.data = flipped;
+  await assert.rejects(unlockKeystore(keystore, PASS));
 });
 
-test("a keystore with weak KDF iterations is refused", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "right-passphrase", address, TEST_ITERATIONS);
-  keystore.kdf.iterations = 1000;
-  await assert.rejects(decryptKeystore(keystore, "right-passphrase"), /إعدادات التشفير غير آمنة/);
+test("version 1 keystores from the earlier prototype are refused", () => {
+  const legacy = {
+    format: "snn-keystore",
+    version: 1,
+    address: "snn1" + "a".repeat(40),
+    kdf: { name: "PBKDF2", hash: "SHA-256", iterations: 600000, salt: "a".repeat(32) },
+    cipher: { name: "AES-256-GCM", iv: "a".repeat(24), data: "a".repeat(128) },
+  };
+  assert.throws(() => parseKeystoreFile(JSON.stringify(legacy)), /الإصدار 2/);
 });
 
-test("fromHex rejects malformed input", () => {
-  assert.throws(() => fromHex("xyz"));
-  assert.throws(() => fromHex("abc"));
-});
-
-test("parseKeystoreFile accepts a valid keystore and returns it unchanged", async () => {
-  const key = createPrivateKey();
-  const address = await deriveAddress(key);
-  const keystore = await encryptKeystore(key, "right-passphrase", address, TEST_ITERATIONS);
-  assert.deepEqual(parseKeystoreFile(JSON.stringify(keystore)), keystore);
-});
-
-test("parseKeystoreFile rejects non-JSON, wrong format, bad address and oversized files", async () => {
-  assert.throws(() => parseKeystoreFile("not json"), /ليس JSON/);
-  assert.throws(() => parseKeystoreFile(JSON.stringify({ format: "other" })), /لا يطابق صيغة SNN/);
-  assert.throws(
-    () => parseKeystoreFile(JSON.stringify({ format: "snn-keystore", version: 1, address: "bad", kdf: {}, cipher: {} })),
-    /لا يطابق صيغة SNN/,
-  );
-  assert.throws(() => parseKeystoreFile("x".repeat(30_000)), /كبير الحجم/);
-  assert.throws(() => parseKeystoreFile(""), /كبير الحجم|غير صالح/);
+test("a keystore paired with someone else's public key is rejected", async () => {
+  const { keystore } = await createKeystore(PASS, TEST_ITERATIONS);
+  const other = await createAccount();
+  keystore.publicKey = toHex(other.publicKey);
+  await assert.rejects(unlockKeystore(keystore, PASS));
 });

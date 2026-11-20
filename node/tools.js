@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createAccount, toHex } from "../js/signing.js";
 import { createGenesisConfig } from "../chain/core.js";
+import { createTlsIdentity } from "./tls.js";
 
 export const DEFAULT_VALIDATORS = 4;
 export const DEFAULT_MAX_SHARE_BPS = 4000; // 40%, for a 4-validator test network
@@ -20,17 +21,27 @@ export async function generateValidatorKey() {
 export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS } = {}) {
   mkdirSync(dir, { recursive: true });
   const validators = [];
-  for (let i = 1; i <= count; i++) validators.push(await generateValidatorKey());
+  for (let i = 1; i <= count; i++) {
+    const key = await generateValidatorKey();
+    key.tls = createTlsIdentity(`snn-validator-${i}`); // { key, cert, fingerprint }
+    validators.push(key);
+  }
   const genesis = createGenesisConfig({
     chainId,
     timestamp: Math.floor(Date.now() / 1000),
     allocations,
-    validators: validators.map((v) => ({ publicKey: v.publicKey, stake: DEFAULT_STAKE })),
+    validators: validators.map((v) => ({
+      publicKey: v.publicKey,
+      stake: DEFAULT_STAKE,
+      tlsFingerprint: v.tls.fingerprint,
+    })),
     maxShareBps,
   });
   writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2));
   validators.forEach((key, i) => {
-    writeFileSync(join(dir, `validator-${i + 1}.json`), JSON.stringify(key, null, 2), { mode: 0o600 });
+    const { fingerprint, ...tls } = key.tls; // the file keeps the key material, not the derived fingerprint
+    const file = { ...key, tls };
+    writeFileSync(join(dir, `validator-${i + 1}.json`), JSON.stringify(file, null, 2), { mode: 0o600 });
   });
   return { genesis, validators };
 }

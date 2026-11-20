@@ -117,7 +117,7 @@ export function createGenesisConfig({ chainId, timestamp, allocations, validator
     maxShareBps: Number(maxShareBps),
     allocations: [...allocations].sort(),
     validators: validators
-      .map((v) => ({ publicKey: v.publicKey, stake: String(v.stake) }))
+      .map((v) => ({ publicKey: v.publicKey, stake: String(v.stake), tlsFingerprint: v.tlsFingerprint ?? null }))
       .sort((a, b) => (a.publicKey < b.publicKey ? -1 : 1)),
   };
 }
@@ -135,6 +135,9 @@ export function validateGenesis(config) {
     if (!HEX_64.test(v.publicKey)) throw bad("مفتاح مدقق غير صالح.");
     if (seen.has(v.publicKey)) throw bad("مدقق مكرر في التأسيس.");
     if (!DECIMAL_STAKE.test(v.stake)) throw bad("حصة المدقق يجب أن تكون عدداً صحيحاً موجباً.");
+    if (v.tlsFingerprint !== null && !HEX_64.test(v.tlsFingerprint ?? "")) {
+      throw bad("بصمة شهادة TLS للمدقق غير صالحة.");
+    }
     seen.add(v.publicKey);
   }
 }

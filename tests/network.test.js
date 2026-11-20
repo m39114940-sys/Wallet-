@@ -14,6 +14,7 @@ import { initNetwork } from "../node/tools.js";
 import { buildBlock, voteMessage } from "../chain/core.js";
 import { signText } from "../chain/crypto.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
+import { peerRequest } from "../node/tls.js";
 
 const CLI = fileURLToPath(new URL("../node/cli.js", import.meta.url));
 const CHAIN = "snn-testnet-itest";
@@ -23,6 +24,7 @@ let dir;
 let alice;
 let bob;
 let validators;
+let pins;
 let nodes;
 
 function freePort() {
@@ -50,21 +52,17 @@ function startNode(name, port, validatorIndex, peerUrls) {
   const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
   child.stderr.on("data", (d) => process.env.SNN_TEST_DEBUG && process.stderr.write(d));
   procs.set(name, child);
-  return { name, url: `http://127.0.0.1:${port}` };
+  return { name, url: `https://127.0.0.1:${port}` };
 }
 
 async function get(node, path) {
-  const res = await fetch(`${node.url}${path}`);
-  return { status: res.status, body: await res.json() };
+  const res = await peerRequest({ url: node.url, path, pins });
+  return { status: res.status, body: res.body };
 }
 
-async function post(node, path, body) {
-  const res = await fetch(`${node.url}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return { status: res.status, body: await res.json() };
+async function post(node, path, body, headers = {}) {
+  const res = await peerRequest({ url: node.url, method: "POST", path, body, headers, pins });
+  return { status: res.status, body: res.body };
 }
 
 async function waitFor(predicate, label, timeoutMs = 30_000) {
@@ -107,6 +105,7 @@ before(async () => {
   alice = await makeAccount();
   bob = await makeAccount();
   ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address]));
+  pins = new Set(validators.map((v) => v.tls.fingerprint));
 });
 
 after(() => {
@@ -116,7 +115,7 @@ after(() => {
 
 test("four validators agree on certified blocks, survive a crash, and punish double signing", async () => {
   const ports = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
-  const urls = ports.map((p) => `http://127.0.0.1:${p}`);
+  const urls = ports.map((p) => `https://127.0.0.1:${p}`);
   // Full mesh: every validator knows every other one from the start.
   nodes = ports.map((port, i) =>
     startNode(`v${i + 1}`, port, i + 1, urls.filter((_, j) => j !== i)),
@@ -203,16 +202,17 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
 
   // 7. Peers cannot be added from the network. A forged header adds nothing, /peers is gone,
   //    and /sync refuses any address that the operator did not configure.
-  await fetch(`${v1.url}/status`, { headers: { "x-peer-url": "http://127.0.0.1:1" } });
-  assert.ok(!(await get(v1, "/status")).body.peers.includes("http://127.0.0.1:1"));
-  assert.equal((await post(v1, "/peers", { url: "http://127.0.0.1:1" })).status, 404);
-  const foreignSync = await post(v1, "/sync", { url: "http://127.0.0.1:1" });
+  await peerRequest({ url: v1.url, path: "/status", headers: { "x-peer-url": "https://127.0.0.1:1" }, pins });
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins: new Set(["0".repeat(64)]) }), { code: "TLS_PIN_MISMATCH" });
+  assert.ok(!(await get(v1, "/status")).body.peers.includes("https://127.0.0.1:1"));
+  assert.equal((await post(v1, "/peers", { url: "https://127.0.0.1:1" })).status, 404);
+  const foreignSync = await post(v1, "/sync", { url: "https://127.0.0.1:1" });
   assert.equal(foreignSync.status, 400);
   assert.equal(foreignSync.body.code, "PEER_NOT_ALLOWED");
 
   // 8. A flood from one address is throttled, and the node recovers once the bucket refills.
   const flood = await Promise.all(
-    Array.from({ length: 600 }, () => fetch(`${v1.url}/status`).then((r) => r.status)),
+    Array.from({ length: 600 }, () => get(v1, "/status").then((r) => r.status)),
   );
   assert.ok(flood.includes(429), "a burst above the limit is refused");
   await waitFor(async () => (await get(v1, "/status")).status === 200, "rate limit recovers", 10_000);

@@ -11,6 +11,8 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import http from "node:http";
+import https from "node:https";
+import { peerRequest } from "./tls.js";
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
@@ -60,6 +62,8 @@ export class ChainNode {
     this.timer = null;
     this.lastError = null;
     this.syncedAt = new Map(); // peer url -> time of the last automatic sync
+    // Trust anchors: the TLS fingerprints of the genesis validators. A peer must present one of these.
+    this.pins = new Set(genesis.validators.map((v) => v.tlsFingerprint).filter((f) => f !== null));
   }
 
   // Automatic syncs (triggered by a message from the future) are rate limited per peer.
@@ -170,14 +174,18 @@ export class ChainNode {
     return this.allowed.has(url);
   }
 
+  // Every peer request is HTTPS and pinned to the validator fingerprints of the genesis configuration.
   async post(peer, path, body, headers = {}) {
-    const res = await fetch(`${peer}${path}`, {
+    const res = await peerRequest({
+      url: peer,
       method: "POST",
-      headers: { "content-type": "application/json", "x-peer-url": this.selfUrl ?? "", ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(PEER_TIMEOUT_MS),
+      path,
+      body,
+      headers: { "x-peer-url": this.selfUrl ?? "", ...headers },
+      pins: this.pins,
+      timeoutMs: PEER_TIMEOUT_MS,
     });
-    return res.ok;
+    return res.status === 200;
   }
 
   // Failures are ignored on purpose: a dead peer must never stop the local node.
@@ -339,11 +347,14 @@ export class ChainNode {
     if (!this.isAllowedPeer(url)) throw new ChainError("PEER_NOT_ALLOWED", "هذا العنوان ليس نظيراً معتمداً.");
     const blocks = [];
     for (let from = 0; ; ) {
-      const res = await fetch(`${url}/blocks?from=${from}&limit=${MAX_PAGE}`, {
-        signal: AbortSignal.timeout(10_000),
+      const res = await peerRequest({
+        url,
+        path: `/blocks?from=${from}&limit=${MAX_PAGE}`,
+        pins: this.pins,
+        timeoutMs: 10_000,
       });
-      if (!res.ok) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
-      const page = await res.json();
+      if (res.status !== 200) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
+      const page = res.body;
       if (!Array.isArray(page) || page.length > MAX_PAGE) throw new ChainError("SYNC_FAILED", "استجابة المزامنة غير صالحة.");
       blocks.push(...page);
       if (blocks.length > MAX_SYNC_BLOCKS) throw new ChainError("SYNC_FAILED", "السلسلة المعروضة أكبر من الحد المسموح.");
@@ -419,9 +430,10 @@ function makeLimiter() {
   };
 }
 
-export function createHttpServer(node) {
+// tlsOptions: { key, cert } PEM. Without it the server is plain HTTP, which only tests should use.
+export function createHttpServer(node, tlsOptions = null) {
   const allow = makeLimiter();
-  return http.createServer(async (req, res) => {
+  const handler = async (req, res) => {
     try {
       if (!allow(req.socket.remoteAddress ?? "unknown")) {
         return sendJson(res, 429, { error: "rate limited", code: "RATE_LIMITED" });
@@ -470,5 +482,6 @@ export function createHttpServer(node) {
         code: known ? err.code : "INTERNAL",
       });
     }
-  });
+  };
+  return tlsOptions ? https.createServer(tlsOptions, handler) : http.createServer(handler);
 }

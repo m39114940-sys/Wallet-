@@ -1,10 +1,13 @@
 #!/usr/bin/env node
-// Starts one SNN node. Example (validator 1 of a 4-validator network):
+// Starts one validator node. Example (validator 1 of a 4-validator network):
 //   node node/cli.js --port 8001 --data ./data/1 --genesis ./net/genesis.json \
-//     --validator-key ./net/validator-1.json --peer http://127.0.0.1:8002 --round-ms 1000
+//     --validator-key ./net/validator-1.json --peer https://127.0.0.1:8002 --round-ms 1000
+//
+// Every node is a validator for now. Relay nodes need their own pinned identity, which is not built yet.
 
 import { readFileSync } from "node:fs";
 import { ChainNode, createHttpServer } from "./node.js";
+import { fingerprintOfPem } from "./tls.js";
 
 function parseArgs(argv) {
   const args = { peers: [] };
@@ -18,35 +21,44 @@ function parseArgs(argv) {
   return args;
 }
 
-const args = parseArgs(process.argv.slice(2));
-const host = args.host ?? "127.0.0.1";
-const port = Number(args.port);
-if (!Number.isInteger(port) || !args.data || !args.genesis) {
-  console.error(
-    "required: --port <n> --data <dir> --genesis <file> [--validator-key <file>] [--peer <url>]... [--round-ms <n>]",
-  );
+function fail(message) {
+  console.error(message);
   process.exit(2);
 }
 
+const args = parseArgs(process.argv.slice(2));
+const host = args.host ?? "127.0.0.1";
+const port = Number(args.port);
+if (!Number.isInteger(port) || !args.data || !args.genesis || !args["validator-key"]) {
+  fail(
+    "required: --port <n> --data <dir> --genesis <file> --validator-key <file> [--peer <https-url>]... [--round-ms <n>]",
+  );
+}
+
 const genesis = JSON.parse(readFileSync(args.genesis, "utf8"));
-const validator = args["validator-key"] ? JSON.parse(readFileSync(args["validator-key"], "utf8")) : null;
-if (validator && !genesis.validators.some((v) => v.publicKey === validator.publicKey)) {
-  console.error("validator key is not in the genesis validator set");
-  process.exit(2);
+const validator = JSON.parse(readFileSync(args["validator-key"], "utf8"));
+const entry = genesis.validators.find((v) => v.publicKey === validator.publicKey);
+if (!entry) fail("validator key is not in the genesis validator set");
+if (!validator.tls?.key || !validator.tls?.cert) fail("validator key file has no TLS identity");
+if (fingerprintOfPem(validator.tls.cert) !== entry.tlsFingerprint) {
+  fail("TLS certificate does not match the fingerprint in the genesis");
+}
+for (const peer of args.peers) {
+  if (!peer.startsWith("https://")) fail(`peer must use https: ${peer}`);
 }
 
 const node = new ChainNode({
   dataDir: args.data,
   genesis,
-  validator,
-  selfUrl: args.self ?? `http://${host}:${port}`,
+  validator: { publicKey: validator.publicKey, privateKeyDer: validator.privateKeyDer },
+  selfUrl: args.self ?? `https://${host}:${port}`,
   roundMs: Number(args["round-ms"] ?? 1000),
   log: (msg) => console.error(JSON.stringify({ event: "log", msg })),
 });
 await node.init();
 for (const peer of args.peers) node.addPeer(peer);
 
-const server = createHttpServer(node);
+const server = createHttpServer(node, { key: validator.tls.key, cert: validator.tls.cert });
 server.listen(port, host, async () => {
   await node.syncFromPeers();
   node.start();

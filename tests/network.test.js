@@ -25,6 +25,7 @@ let alice;
 let bob;
 let validators;
 let pins;
+const KEY_PASSPHRASE = "network-test-passphrase";
 let clientId; // validator 0's identity, presented as the client certificate
 let nodes;
 
@@ -50,7 +51,10 @@ function startNode(name, port, validatorIndex, peerUrls) {
     "--round-ms", String(ROUND_MS),
   ];
   for (const p of peerUrls) args.push("--peer", p);
-  const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, SNN_VALIDATOR_PASSPHRASE: KEY_PASSPHRASE },
+  });
   child.stderr.on("data", (d) => process.env.SNN_TEST_DEBUG && process.stderr.write(d));
   procs.set(name, child);
   return { name, url: `https://127.0.0.1:${port}` };
@@ -105,7 +109,8 @@ before(async () => {
   dir = mkdtempSync(join(tmpdir(), "snn-net-"));
   alice = await makeAccount();
   bob = await makeAccount();
-  ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address]));
+  // Validator keys are encrypted, so every node must open its file with the passphrase.
+  ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address], { passphrase: KEY_PASSPHRASE }));
   pins = new Set(validators.map((v) => v.tls.fingerprint));
   clientId = { key: validators[0].tls.key, cert: validators[0].tls.cert };
 });

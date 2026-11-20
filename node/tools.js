@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createAccount, toHex } from "../js/signing.js";
 import { createGenesisConfig } from "../chain/core.js";
 import { createTlsIdentity } from "./tls.js";
+import { encryptKeyfile } from "./keyfile.js";
 
 export const DEFAULT_VALIDATORS = 4;
 export const DEFAULT_MAX_SHARE_BPS = 4000; // 40%, for a 4-validator test network
@@ -18,7 +19,8 @@ export async function generateValidatorKey() {
   return { privateKeyDer: toHex(account.privateKeyDer), publicKey: toHex(account.publicKey) };
 }
 
-export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS } = {}) {
+// passphrase: when set, every validator file is encrypted with it. When null, files are plaintext (tests only).
+export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS, passphrase = null } = {}) {
   mkdirSync(dir, { recursive: true });
   const validators = [];
   for (let i = 1; i <= count; i++) {
@@ -40,7 +42,7 @@ export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_V
   writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2));
   validators.forEach((key, i) => {
     const { fingerprint, ...tls } = key.tls; // the file keeps the key material, not the derived fingerprint
-    const file = { ...key, tls };
+    const file = passphrase === null ? { ...key, tls } : encryptKeyfile({ ...key, tls }, passphrase);
     writeFileSync(join(dir, `validator-${i + 1}.json`), JSON.stringify(file, null, 2), { mode: 0o600 });
   });
   return { genesis, validators };
@@ -52,6 +54,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error("usage: node node/tools.js init <dir> <chainId> <address> [<address> ...]");
     process.exit(2);
   }
-  await initNetwork(dir, chainId, allocations);
+  const passphrase = process.env.SNN_VALIDATOR_PASSPHRASE;
+  if (!passphrase) {
+    console.error("set SNN_VALIDATOR_PASSPHRASE to encrypt the validator key files");
+    process.exit(2);
+  }
+  await initNetwork(dir, chainId, allocations, { passphrase });
   console.log(`network files written to ${dir}`);
 }

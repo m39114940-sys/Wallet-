@@ -8,6 +8,7 @@
 import { readFileSync } from "node:fs";
 import { ChainNode, createHttpServer } from "./node.js";
 import { fingerprintOfPem } from "./tls.js";
+import { openValidatorKey } from "./keyfile.js";
 
 function parseArgs(argv) {
   const args = { peers: [] };
@@ -36,7 +37,13 @@ if (!Number.isInteger(port) || !args.data || !args.genesis || !args["validator-k
 }
 
 const genesis = JSON.parse(readFileSync(args.genesis, "utf8"));
-const validator = JSON.parse(readFileSync(args["validator-key"], "utf8"));
+// Encrypted key files need SNN_VALIDATOR_PASSPHRASE in the environment. It is never accepted as an argument.
+let validator;
+try {
+  validator = openValidatorKey(JSON.parse(readFileSync(args["validator-key"], "utf8")), process.env.SNN_VALIDATOR_PASSPHRASE);
+} catch (err) {
+  fail(`cannot open validator key: ${err.message}`);
+}
 const entry = genesis.validators.find((v) => v.publicKey === validator.publicKey);
 if (!entry) fail("validator key is not in the genesis validator set");
 if (!validator.tls?.key || !validator.tls?.cert) fail("validator key file has no TLS identity");

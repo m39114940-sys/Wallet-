@@ -25,6 +25,7 @@ import {
   replayChain,
   txId,
   verifyEvidence,
+  MAX_CLOCK_DRIFT_MS,
 } from "../chain/core.js";
 import { Consensus } from "../chain/consensus.js";
 
@@ -35,6 +36,8 @@ const TICK_MS = 50;
 const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
 const RATE_PER_SEC = 200; // requests per second refilled per remote address
 const RATE_BURST = 400;
+const MAX_PAGE = 200; // blocks per request, both when serving and when syncing
+const MAX_SYNC_BLOCKS = 100_000;
 
 const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
@@ -47,6 +50,7 @@ export class ChainNode {
     this.selfUrl = selfUrl;
     this.log = log;
     this.peers = new Set();
+    this.allowed = new Set(); // peers named by the operator; nothing learned from the network adds to this
     this.blocks = [];
     this.state = null;
     this.mempool = new Map();
@@ -60,6 +64,7 @@ export class ChainNode {
 
   // Automatic syncs (triggered by a message from the future) are rate limited per peer.
   async syncIfDue(url) {
+    if (!this.isAllowedPeer(url)) return { adopted: false, skipped: true };
     const last = this.syncedAt.get(url) ?? 0;
     if (Date.now() - last < SYNC_COOLDOWN_MS) return { adopted: false, skipped: true };
     this.syncedAt.set(url, Date.now());
@@ -140,8 +145,8 @@ export class ChainNode {
     };
   }
 
-  blocksFrom(height) {
-    return this.blocks.filter((b) => b.height >= height);
+  blocksFrom(height, limit = MAX_PAGE) {
+    return this.blocks.slice(height, height + Math.min(limit, MAX_PAGE));
   }
 
   balance(address) {
@@ -154,9 +159,15 @@ export class ChainNode {
 
   // ---------- Peers and gossip ----------
 
+  // Peers come only from the operator's configuration (--peer). Nothing received over the network adds one.
   addPeer(url) {
     if (url === this.selfUrl) return;
+    this.allowed.add(url);
     this.peers.add(url);
+  }
+
+  isAllowedPeer(url) {
+    return this.allowed.has(url);
   }
 
   async post(peer, path, body, headers = {}) {
@@ -218,7 +229,7 @@ export class ChainNode {
     }
     return buildBlock({
       height: this.tip.height + 1,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Math.max(Date.now(), this.tip.timestamp + 1), // milliseconds, strictly increasing
       prevHash: this.tip.hash,
       txs: included,
       evidence,
@@ -314,6 +325,9 @@ export class ChainNode {
       if (fromUrl) await this.syncIfDue(fromUrl).catch(() => null);
       return { accepted: false, reason: "behind, synced" };
     }
+    if (!(block.timestamp <= Date.now() + MAX_CLOCK_DRIFT_MS)) {
+      throw new ChainError("BAD_TIMESTAMP", "الكتلة مختومة بوقت أبعد من الساعة المسموحة.");
+    }
     const state = await applyCommitted(this.state, block, this.tip, this.genesis);
     await this.commitBlock(block, state);
     this.gossip("/block", block, fromUrl);
@@ -322,9 +336,20 @@ export class ChainNode {
 
   // Downloads a peer's full chain and adopts it only if it replays from genesis and is longer than ours.
   async sync(url) {
-    const res = await fetch(`${url}/blocks?from=0`, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
-    const blocks = await res.json();
+    if (!this.isAllowedPeer(url)) throw new ChainError("PEER_NOT_ALLOWED", "هذا العنوان ليس نظيراً معتمداً.");
+    const blocks = [];
+    for (let from = 0; ; ) {
+      const res = await fetch(`${url}/blocks?from=${from}&limit=${MAX_PAGE}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
+      const page = await res.json();
+      if (!Array.isArray(page) || page.length > MAX_PAGE) throw new ChainError("SYNC_FAILED", "استجابة المزامنة غير صالحة.");
+      blocks.push(...page);
+      if (blocks.length > MAX_SYNC_BLOCKS) throw new ChainError("SYNC_FAILED", "السلسلة المعروضة أكبر من الحد المسموح.");
+      if (page.length < MAX_PAGE) break;
+      from += page.length;
+    }
     if (!Array.isArray(blocks) || blocks.length <= this.blocks.length) {
       return { adopted: false, height: this.tip.height };
     }
@@ -381,6 +406,9 @@ function makeLimiter() {
   const buckets = new Map();
   return (key) => {
     const now = Date.now();
+    if (buckets.size > 10_000) {
+      for (const [k, v] of buckets) if (now - v.at > 60_000) buckets.delete(k);
+    }
     const b = buckets.get(key) ?? { tokens: RATE_BURST, at: now };
     b.tokens = Math.min(RATE_BURST, b.tokens + ((now - b.at) * RATE_PER_SEC) / 1000);
     b.at = now;
@@ -400,15 +428,15 @@ export function createHttpServer(node) {
       }
       const url = new URL(req.url, "http://localhost");
       const { pathname } = url;
-      // Any peer that talks to us is added to our peer list, so a full mesh forms from partial knowledge.
+      // Sent by peers, used only to skip them when re-gossiping. It never adds a peer.
       const fromUrl = req.headers["x-peer-url"] || null;
-      if (fromUrl) node.addPeer(fromUrl);
 
       if (req.method === "GET" && pathname === "/status") return sendJson(res, 200, node.status());
       if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);
-        return sendJson(res, 200, node.blocksFrom(Number.isInteger(from) && from >= 0 ? from : 0));
+        const limit = Number(url.searchParams.get("limit") ?? MAX_PAGE);
+        return sendJson(res, 200, node.blocksFrom(Number.isInteger(from) && from >= 0 ? from : 0, limit));
       }
       if (req.method === "GET" && pathname === "/balance") {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
@@ -428,11 +456,6 @@ export function createHttpServer(node) {
       if (req.method === "POST" && pathname === "/evidence") {
         const body = await readJson(req);
         return sendJson(res, 200, await node.run(() => node.receiveEvidence(body, fromUrl)));
-      }
-      if (req.method === "POST" && pathname === "/peers") {
-        const body = await readJson(req);
-        node.addPeer(requirePeerUrl(body));
-        return sendJson(res, 200, { peers: [...node.peers] });
       }
       if (req.method === "POST" && pathname === "/sync") {
         const body = await readJson(req);

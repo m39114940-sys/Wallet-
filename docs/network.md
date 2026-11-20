@@ -72,14 +72,13 @@ node node/cli.js --port 8001 --data ./data/1 --genesis ./net/genesis.json \
 |---|---|---|
 | GET | `/status` | الارتفاع، تجزئة الذروة، الجولة الحالية، عدد النظراء والمعاملات والأدلة |
 | GET | `/validators` | المدققون مع حصصهم وحالة الحجب |
-| GET | `/blocks?from=n` | الكتل من الارتفاع n مع شهاداتها |
+| GET | `/blocks?from=n&limit=200` | صفحة من الكتل ابتداءً من الارتفاع n مع شهاداتها |
 | GET | `/balance?address=` | الرصيد والرقم التسلسلي التالي |
 | POST | `/tx` | إرسال معاملة موقّعة |
 | POST | `/consensus` | رسائل الإجماع: `{kind: "proposal" \| "vote", payload}` |
 | POST | `/block` | كتلة معتمدة بشهادتها |
 | POST | `/evidence` | دليل توقيع مزدوج |
-| POST | `/peers` | إضافة نظير |
-| POST | `/sync` | مزامنة من نظير |
+| POST | `/sync` | مزامنة من نظير معتمد من الإعداد فقط |
 
 ## الاختبارات
 

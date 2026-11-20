@@ -19,7 +19,15 @@
 // Proposals are made only when there is pending work, so idle chains do not grow.
 
 import { signText, verifyText } from "./crypto.js";
-import { ChainError, NIL, applyBlock, proposalMessage, validatorWeights, voteMessage } from "./core.js";
+import {
+  ChainError,
+  MAX_CLOCK_DRIFT_MS,
+  NIL,
+  applyBlock,
+  proposalMessage,
+  validatorWeights,
+  voteMessage,
+} from "./core.js";
 import { proposerFor, hasQuorum, hasOneThird } from "./weights.js";
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -164,8 +172,10 @@ export class Consensus {
     if (this.proposals.has(p.round)) return "duplicate";
     if (p.polkaRound >= 0) await this.verifyPolka(p.block.hash, p.polkaRound, p.polka);
 
-    const tip = this.node.tip;
-    const state = await applyBlock(this.node.state, p.block, { height: tip.height, hash: tip.hash }, this.node.genesis);
+    if (!(p.block.timestamp <= Date.now() + MAX_CLOCK_DRIFT_MS)) {
+      throw new ChainError("BAD_TIMESTAMP", "الكتلة مختومة بوقت أبعد من الساعة المسموحة.");
+    }
+    const state = await applyBlock(this.node.state, p.block, this.node.tip, this.node.genesis);
     this.proposals.set(p.round, p);
     this.blocks.set(p.block.hash, { block: p.block, state });
     this.noteSeen(p.from, p.round);

@@ -58,7 +58,7 @@ test("two prevotes for different blocks are punished the same way as double prec
       signature: await sign(keys[i], "precommit", 1, 0, b1.hash),
     });
   }
-  const state1 = await applyCommitted(genesisState(config), cert1, { height: 0, hash: genesis.hash }, config);
+  const state1 = await applyCommitted(genesisState(config), cert1, { height: 0, hash: genesis.hash, timestamp: 1_700_000_000 }, config);
 
   const a = "e".repeat(64);
   const b = "f".repeat(64);
@@ -80,7 +80,7 @@ test("two prevotes for different blocks are punished the same way as double prec
       signature: await sign(keys[i], "precommit", 2, 0, b2.hash),
     });
   }
-  const state2 = await applyCommitted(state1, cert2, { height: 1, hash: b1.hash }, config);
+  const state2 = await applyCommitted(state1, cert2, { height: 1, hash: b1.hash, timestamp: 1_700_000_010 }, config);
   assert.equal(state2.stakes.get(keys[3].publicKey), 950000000n);
   assert.ok(state2.jailed.has(keys[3].publicKey));
 });

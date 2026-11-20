@@ -12,6 +12,7 @@ import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
 export const GENESIS_PREV_HASH = "0".repeat(64);
 export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
 export const NIL = "nil"; // vote for "no block"
+export const MAX_CLOCK_DRIFT_MS = 15_000; // a new block may not be stamped more than this far ahead of our clock
 export const EVIDENCE_TYPES = ["prevote", "precommit"];
 
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -269,6 +270,10 @@ export async function applyBlock(state, block, parent, config) {
   if (block.evidenceRoot !== evidenceRootOf(block.evidence)) {
     throw new ChainError("BAD_EVIDENCE_ROOT", "جذر الأدلة لا يطابق محتواها.");
   }
+  // Timestamps must strictly increase along the chain, so history cannot be reordered or stamped out of time.
+  if (!Number.isSafeInteger(block.timestamp) || !(block.timestamp > parent.timestamp)) {
+    throw new ChainError("BAD_TIMESTAMP", "الطابع الزمني يجب أن يزيد عن طابع الكتلة السابقة.");
+  }
 
   const next = await cloneState(state);
   let previousKey = null;
@@ -312,10 +317,10 @@ export async function replayChain(blocks, config) {
     throw new ChainError("BAD_GENESIS", "الكتلة الأولى لا تطابق الكتلة التأسيسية.");
   }
   let state = genesisState(config);
-  let parent = { height: 0, hash: genesis.hash };
+  let parent = genesis;
   for (const block of blocks.slice(1)) {
     state = await applyCommitted(state, block, parent, config);
-    parent = { height: block.height, hash: block.hash };
+    parent = block;
   }
   return state;
 }

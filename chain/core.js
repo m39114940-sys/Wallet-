@@ -3,15 +3,16 @@
 // certified blocks always produce the same state.
 //
 // State: { ledger, stakes: Map<publicKey, bigint>, jailed: Set<publicKey> }
-// Stakes are micro-SNN units, so slashing uses integer arithmetic only.
+// Stakes and weights are integers (micro-SNN units), so slashing and quorum use exact arithmetic.
 
 import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
-import { capWeights, DEFAULT_MAX_SHARE, hasQuorum } from "../consensus/sim.js";
+import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
 
 export const GENESIS_PREV_HASH = "0".repeat(64);
-export const SLASH_PERCENT = 5n; // equivocation burns 5% of the stake and jails the validator
+export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
 export const NIL = "nil"; // vote for "no block"
+export const EVIDENCE_TYPES = ["prevote", "precommit"];
 
 const HEX_64 = /^[0-9a-f]{64}$/;
 const DECIMAL_STAKE = /^[1-9][0-9]*$/;
@@ -60,7 +61,7 @@ export function merkleRoot(hashes) {
 
 // ---------- Messages that validators sign ----------
 
-// A validator signs one of these for each vote. The chain id prevents replay on another network.
+// The chain id prevents replay on another network. The vote type is "prevote", "precommit", or NIL as target.
 export const voteMessage = (chainId, type, height, round, blockHash) =>
   `SNN-VOTE-v1|${chainId}|${type}|${height}|${round}|${blockHash}`;
 
@@ -69,10 +70,13 @@ export const proposalMessage = (chainId, height, round, polkaRound, blockHash) =
 
 // ---------- Evidence of double signing ----------
 
+// Two different votes of one type from one validator, for the same height and round.
+// A prevote pair and a precommit pair are both punished the same way.
 export function normalizeEvidence(ev) {
   if (ev === null || typeof ev !== "object") throw new ChainError("BAD_EVIDENCE", "دليل التوقيع المزدوج غير صالح.");
-  const { validator, height, round, blockA, signatureA, blockB, signatureB } = ev;
+  const { type, validator, height, round, blockA, signatureA, blockB, signatureB } = ev;
   const ok =
+    EVIDENCE_TYPES.includes(type) &&
     typeof validator === "string" &&
     Number.isInteger(height) &&
     height >= 0 &&
@@ -83,12 +87,11 @@ export function normalizeEvidence(ev) {
     typeof signatureA === "string" &&
     typeof signatureB === "string";
   if (!ok) throw new ChainError("BAD_EVIDENCE", "شكل دليل التوقيع المزدوج غير صالح.");
-  return { validator, height, round, blockA, signatureA, blockB, signatureB };
+  return { type, validator, height, round, blockA, signatureA, blockB, signatureB };
 }
 
-export const evidenceKey = (ev) => `${ev.validator}|${ev.height}|${ev.round}`;
+export const evidenceKey = (ev) => `${ev.validator}|${ev.type}|${ev.height}|${ev.round}`;
 
-// Two different precommits from one validator for the same height and round. The signatures prove it.
 // The caller decides the height limit, because the rule depends on which block would include the evidence.
 export async function verifyEvidence(evRaw, chainId, state) {
   const ev = normalizeEvidence(evRaw);
@@ -96,16 +99,8 @@ export async function verifyEvidence(evRaw, chainId, state) {
   if (!state.stakes.has(ev.validator) || state.jailed.has(ev.validator)) {
     throw new ChainError("BAD_EVIDENCE", "المدقق غير نشط.");
   }
-  const okA = await verifyText(
-    ev.validator,
-    voteMessage(chainId, "precommit", ev.height, ev.round, ev.blockA),
-    ev.signatureA,
-  );
-  const okB = await verifyText(
-    ev.validator,
-    voteMessage(chainId, "precommit", ev.height, ev.round, ev.blockB),
-    ev.signatureB,
-  );
+  const okA = await verifyText(ev.validator, voteMessage(chainId, ev.type, ev.height, ev.round, ev.blockA), ev.signatureA);
+  const okB = await verifyText(ev.validator, voteMessage(chainId, ev.type, ev.height, ev.round, ev.blockB), ev.signatureB);
   if (!okA || !okB) throw new ChainError("BAD_EVIDENCE", "توقيع دليل التوقيع المزدوج غير صحيح.");
   return ev;
 }
@@ -113,11 +108,12 @@ export async function verifyEvidence(evRaw, chainId, state) {
 // ---------- Genesis ----------
 
 // validators: [{ publicKey (hex), stake (decimal string of micro-SNN units) }]
-export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShare = DEFAULT_MAX_SHARE }) {
+// maxShareBps: the largest weight one validator may carry, in basis points.
+export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS }) {
   return {
     chainId,
     timestamp,
-    maxShare,
+    maxShareBps: Number(maxShareBps),
     allocations: [...allocations].sort(),
     validators: validators
       .map((v) => ({ publicKey: v.publicKey, stake: String(v.stake) }))
@@ -129,7 +125,9 @@ export function validateGenesis(config) {
   const bad = (msg) => new ChainError("BAD_GENESIS", msg);
   if (config === null || typeof config !== "object") throw bad("ملف التأسيس غير صالح.");
   if (typeof config.chainId !== "string" || config.chainId.length === 0) throw bad("معرّف الشبكة غير صالح.");
-  if (!(config.maxShare > 0 && config.maxShare <= 1)) throw bad("حد الحصة يجب أن يكون في (0, 1].");
+  if (!Number.isInteger(config.maxShareBps) || config.maxShareBps < 1 || config.maxShareBps > 10_000) {
+    throw bad("حد الحصة يجب أن يكون عدداً صحيحاً بين 1 و 10000 نقطة أساس.");
+  }
   if (!Array.isArray(config.validators) || config.validators.length === 0) throw bad("لا يوجد مدققون في التأسيس.");
   const seen = new Set();
   for (const v of config.validators) {
@@ -178,20 +176,19 @@ export async function cloneState(state) {
   };
 }
 
-// Active validators are those that are not jailed. Weights are capped so no one holds more than maxShare.
-export function validatorWeights(state, maxShare) {
+// Active validators are those that are not jailed. Weights are integers, capped at maxShareBps.
+export function validatorWeights(state, maxShareBps) {
   const active = new Map();
   for (const [id, stake] of state.stakes) {
-    if (!state.jailed.has(id)) active.set(id, Number(stake));
+    if (!state.jailed.has(id)) active.set(id, stake);
   }
   let weights;
   try {
-    weights = capWeights(active, maxShare);
+    weights = capWeights(active, BigInt(maxShareBps));
   } catch (err) {
     throw new ChainError("NOT_ENOUGH_VALIDATORS", err.message);
   }
-  const total = [...weights.values()].reduce((a, b) => a + b, 0);
-  return { weights, total };
+  return { weights, total: sumOf(weights) };
 }
 
 // ---------- Blocks ----------
@@ -227,24 +224,24 @@ export function buildBlock({ height, timestamp, prevHash, txs, evidence = [] }) 
   return block;
 }
 
-// Checks that the commit certificate was signed by a strict majority above two thirds of the validator
-// set that was active before this block. Signatures from unknown, jailed or repeated validators do not count.
-export async function verifyCertificate(chainId, parentState, block, maxShare) {
+// Checks that the commit certificate was signed by validators holding more than two thirds of the weight
+// that was active before this block. Unknown, jailed or repeated signers do not count.
+export async function verifyCertificate(chainId, parentState, block, maxShareBps) {
   const cert = block.certificate;
   if (cert === null || typeof cert !== "object" || !Number.isInteger(cert.round) || cert.round < 0) {
     throw new ChainError("BAD_CERTIFICATE", "الكتلة بلا شهادة اعتماد صالحة.");
   }
   if (!Array.isArray(cert.signatures)) throw new ChainError("BAD_CERTIFICATE", "شكل شهادة الاعتماد غير صالح.");
-  const { weights, total } = validatorWeights(parentState, maxShare);
-  const message = (round) => voteMessage(chainId, "precommit", block.height, round, block.hash);
+  const { weights, total } = validatorWeights(parentState, maxShareBps);
+  const message = voteMessage(chainId, "precommit", block.height, cert.round, block.hash);
   const seen = new Set();
-  let power = 0;
+  let power = 0n;
   for (const { validator, signature } of cert.signatures) {
     if (!weights.has(validator) || seen.has(validator)) {
       throw new ChainError("BAD_CERTIFICATE", "توقيع من مدقق غير معتمد أو مكرر.");
     }
     seen.add(validator);
-    if (!(await verifyText(validator, message(cert.round), signature))) {
+    if (!(await verifyText(validator, message, signature))) {
       throw new ChainError("BAD_CERTIFICATE", "توقيع الاعتماد غير صحيح.");
     }
     power += weights.get(validator);
@@ -284,6 +281,7 @@ export async function applyBlock(state, block, parent, config) {
     }
     previousKey = key;
     if (ev.height >= block.height) throw new ChainError("BAD_EVIDENCE", "الدليل يخص كتلة لم تُعتمد بعد.");
+    // Checked against `next`, so a second piece of evidence for the same validator in this block fails.
     await verifyEvidence(ev, config.chainId, next);
     const stake = next.stakes.get(ev.validator);
     next.stakes.set(ev.validator, stake - (stake * SLASH_PERCENT) / 100n);
@@ -302,7 +300,7 @@ export async function applyBlock(state, block, parent, config) {
 
 // A block is accepted only with a valid certificate for the validator set that was active before it.
 export async function applyCommitted(state, block, parent, config) {
-  await verifyCertificate(config.chainId, state, block, config.maxShare);
+  await verifyCertificate(config.chainId, state, block, config.maxShareBps);
   return applyBlock(state, block, parent, config);
 }
 

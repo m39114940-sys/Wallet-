@@ -166,6 +166,7 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   const blockA = "a".repeat(64);
   const blockB = "b".repeat(64);
   const evidence = {
+    type: "precommit",
     validator: culprit.publicKey,
     height: 1,
     round: 0,
@@ -199,4 +200,11 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   await waitFor(async () => (await height(v2)) === (await height(v3)), "v2 and v3 at one height");
   assert.equal(await balanceUnits(v2, alice.address), "96000000");
   assert.equal((await get(v1, "/status")).body.tipHash, (await get(v2, "/status")).body.tipHash);
+
+  // 7. A flood from one address is throttled, and the node recovers once the bucket refills.
+  const flood = await Promise.all(
+    Array.from({ length: 600 }, () => fetch(`${v1.url}/status`).then((r) => r.status)),
+  );
+  assert.ok(flood.includes(429), "a burst above the limit is refused");
+  await waitFor(async () => (await get(v1, "/status")).status === 200, "rate limit recovers", 10_000);
 });

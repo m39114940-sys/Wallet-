@@ -17,7 +17,7 @@ import { signText } from "../chain/crypto.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
 
 const CHAIN = "snn-unit";
-const MAX_SHARE = 0.4;
+const MAX_SHARE = 4000; // basis points: 40%
 const T0 = 1_700_000_000;
 
 async function setup() {
@@ -30,7 +30,7 @@ async function setup() {
     timestamp: T0,
     allocations: [alice.address, bob.address],
     validators: keys.map((k) => ({ publicKey: k.publicKey, stake: DEFAULT_STAKE })),
-    maxShare: MAX_SHARE,
+    maxShareBps: MAX_SHARE,
   });
   return { alice, bob, keys, config };
 }
@@ -113,6 +113,7 @@ test("two precommits for different blocks prove double signing: the validator is
   const culprit = keys[3];
   const sign = (target) => signText(culprit.privateKeyDer, voteMessage(CHAIN, "precommit", 1, 0, target));
   const evidence = {
+    type: "precommit",
     validator: culprit.publicKey,
     height: 1,
     round: 0,
@@ -127,6 +128,7 @@ test("two precommits for different blocks prove double signing: the validator is
   assert.equal(state2.stakes.get(culprit.publicKey), 950000000n); // 5% burned from 1000 SNN
   assert.ok(state2.jailed.has(culprit.publicKey));
   assert.equal(validatorWeights(state2, MAX_SHARE).weights.size, 3);
+  assert.equal(validatorWeights(state2, MAX_SHARE).total > 0n, true);
 
   // A jailed validator's signature no longer counts toward a certificate.
   const b3 = buildBlock({ height: 3, timestamp: T0 + 30, prevHash: b2.hash, txs: [] });
@@ -145,7 +147,7 @@ test("evidence is refused when its signatures do not match or when both votes na
   const blockB = "d".repeat(64);
   const sigA = await signText(culprit.privateKeyDer, voteMessage(CHAIN, "precommit", 0, 0, blockA));
   const sigB = await signText(culprit.privateKeyDer, voteMessage(CHAIN, "precommit", 0, 0, blockB));
-  const base = { validator: culprit.publicKey, height: 0, round: 0, blockA, signatureA: sigA, blockB, signatureB: sigB };
+  const base = { type: "precommit", validator: culprit.publicKey, height: 0, round: 0, blockA, signatureA: sigA, blockB, signatureB: sigB };
 
   const swapped = buildBlock({
     height: 1,
@@ -171,6 +173,7 @@ test("with two of four validators jailed, the weight rules cannot run and the ch
   const state = genesisState(config);
   const jailed = { ...state, jailed: new Set([keys[2].publicKey, keys[3].publicKey]) };
   assert.throws(() => validatorWeights(jailed, MAX_SHARE), { code: "NOT_ENOUGH_VALIDATORS" });
+  assert.equal(state.jailed.size, 0);
 });
 
 test("replaying stored blocks rebuilds the state, and a tampered stored block is refused", async () => {

@@ -9,7 +9,7 @@ import { createAccount, toHex } from "../js/signing.js";
 import { createGenesisConfig } from "../chain/core.js";
 
 export const DEFAULT_VALIDATORS = 4;
-export const DEFAULT_MAX_SHARE = 0.4;
+export const DEFAULT_MAX_SHARE_BPS = 4000; // 40%, for a 4-validator test network
 export const DEFAULT_STAKE = "1000000000"; // 1000 SNN in micro-units
 
 export async function generateValidatorKey() {
@@ -17,7 +17,7 @@ export async function generateValidatorKey() {
   return { privateKeyDer: toHex(account.privateKeyDer), publicKey: toHex(account.publicKey) };
 }
 
-export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShare = DEFAULT_MAX_SHARE } = {}) {
+export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS } = {}) {
   mkdirSync(dir, { recursive: true });
   const validators = [];
   for (let i = 1; i <= count; i++) validators.push(await generateValidatorKey());
@@ -26,7 +26,7 @@ export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_V
     timestamp: Math.floor(Date.now() / 1000),
     allocations,
     validators: validators.map((v) => ({ publicKey: v.publicKey, stake: DEFAULT_STAKE })),
-    maxShare,
+    maxShareBps,
   });
   writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2));
   validators.forEach((key, i) => {

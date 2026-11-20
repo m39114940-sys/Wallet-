@@ -32,6 +32,9 @@ const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
 const MAX_MEMPOOL = 5000;
 const TICK_MS = 50;
+const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
+const RATE_PER_SEC = 200; // requests per second refilled per remote address
+const RATE_BURST = 400;
 
 const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
@@ -52,6 +55,15 @@ export class ChainNode {
     this.consensus = new Consensus({ node: this, keys: validator, roundMs });
     this.timer = null;
     this.lastError = null;
+    this.syncedAt = new Map(); // peer url -> time of the last automatic sync
+  }
+
+  // Automatic syncs (triggered by a message from the future) are rate limited per peer.
+  async syncIfDue(url) {
+    const last = this.syncedAt.get(url) ?? 0;
+    if (Date.now() - last < SYNC_COOLDOWN_MS) return { adopted: false, skipped: true };
+    this.syncedAt.set(url, Date.now());
+    return this.sync(url);
   }
 
   // Every state change runs through this queue, so no two handlers interleave across awaits.
@@ -248,13 +260,13 @@ export class ChainNode {
   async receiveConsensus(kind, payload, fromUrl) {
     if (kind === "proposal") {
       const result = await this.consensus.onProposal(payload);
-      if (result === "behind" && fromUrl) await this.sync(fromUrl);
+      if (result === "behind" && fromUrl) await this.syncIfDue(fromUrl).catch(() => null);
       if (result === "new") this.gossip("/consensus", { kind, payload }, fromUrl);
       return { result };
     }
     if (kind === "vote") {
       const result = await this.consensus.onVote(payload);
-      if (result === "behind" && fromUrl) await this.sync(fromUrl);
+      if (result === "behind" && fromUrl) await this.syncIfDue(fromUrl).catch(() => null);
       if (result === "new") this.gossip("/consensus", { kind, payload }, fromUrl);
       return { result };
     }
@@ -299,7 +311,7 @@ export class ChainNode {
       return { accepted: false, reason: "conflicting block, sync requested" };
     }
     if (block.height > this.tip.height + 1) {
-      if (fromUrl) await this.sync(fromUrl);
+      if (fromUrl) await this.syncIfDue(fromUrl).catch(() => null);
       return { accepted: false, reason: "behind, synced" };
     }
     const state = await applyCommitted(this.state, block, this.tip, this.genesis);
@@ -364,9 +376,28 @@ function requirePeerUrl(body) {
   return body.url;
 }
 
+// Token bucket per remote address. The address comes from the socket, not from a header a peer can set.
+function makeLimiter() {
+  const buckets = new Map();
+  return (key) => {
+    const now = Date.now();
+    const b = buckets.get(key) ?? { tokens: RATE_BURST, at: now };
+    b.tokens = Math.min(RATE_BURST, b.tokens + ((now - b.at) * RATE_PER_SEC) / 1000);
+    b.at = now;
+    buckets.set(key, b);
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  };
+}
+
 export function createHttpServer(node) {
+  const allow = makeLimiter();
   return http.createServer(async (req, res) => {
     try {
+      if (!allow(req.socket.remoteAddress ?? "unknown")) {
+        return sendJson(res, 429, { error: "rate limited", code: "RATE_LIMITED" });
+      }
       const url = new URL(req.url, "http://localhost");
       const { pathname } = url;
       // Any peer that talks to us is added to our peer list, so a full mesh forms from partial knowledge.

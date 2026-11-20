@@ -4,26 +4,26 @@
 // - A validator sends at most one prevote and one precommit per round. So honest validators never
 //   create double-sign evidence against themselves.
 // - When a validator sees a prevote quorum for block X in round r, it locks on X and precommits X.
-// - It prevotes for a different block only when the proposal carries a newer quorum (a "polka")
-//   from a round at least as recent as its lock. Without this rule, two blocks could both commit.
+// - It prevotes for a different block only when the proposal carries a polka (prevote quorum) from a
+//   round at least as recent as its lock. Without this rule, two blocks could both commit.
 // - A block is committed only with precommits from validators holding more than two thirds of weight.
 //
-// Liveness: a proposer that is offline or silent causes a timeout, then the next round picks another
-// proposer. The chain halts (it does not finalize unsafely) when more than one third of weight is silent.
-// Proposals are made only when there is pending work (transactions or evidence), so idle chains do not grow.
+// Hardening against hostile messages:
+// - Votes and proposals more than MAX_ROUND_AHEAD rounds in the future are refused, which bounds memory.
+// - The engine jumps to a later round only when validators holding more than one third of the weight
+//   have already reached it. A single validator cannot drag the network through rounds.
+// - Each validator's signature is checked before any state changes or any sync is requested.
+//
+// Liveness: a silent proposer causes a timeout, and the next round selects another proposer.
+// The chain halts (it does not finalize unsafely) when too much weight is silent.
+// Proposals are made only when there is pending work, so idle chains do not grow.
 
 import { signText, verifyText } from "./crypto.js";
-import {
-  ChainError,
-  NIL,
-  applyBlock,
-  proposalMessage,
-  validatorWeights,
-  voteMessage,
-} from "./core.js";
-import { proposerFor, hasQuorum } from "../consensus/sim.js";
+import { ChainError, NIL, applyBlock, proposalMessage, validatorWeights, voteMessage } from "./core.js";
+import { proposerFor, hasQuorum, hasOneThird } from "./weights.js";
 
 const HASH = /^[0-9a-f]{64}$/;
+const MAX_ROUND_AHEAD = 100;
 const isRound = (r) => Number.isInteger(r) && r >= 0;
 
 export class Consensus {
@@ -44,7 +44,7 @@ export class Consensus {
   ensureHeight() {
     const height = this.node.tip.height + 1;
     if (this.height === height) return;
-    this.vset = validatorWeights(this.node.state, this.node.genesis.maxShare); // may throw: chain halts
+    this.vset = validatorWeights(this.node.state, this.node.genesis.maxShareBps); // may throw: chain halts
     this.height = height;
     this.round = 0;
     this.roundStarted = Date.now();
@@ -53,6 +53,7 @@ export class Consensus {
     this.proposals = new Map(); // round -> proposal
     this.blocks = new Map(); // blockHash -> { block, state }
     this.votes = new Map(); // `${round}|${type}` -> Map(validator -> { blockHash, signature })
+    this.seen = new Map(); // validator -> highest round it has spoken in at this height
     this.sent = new Set(); // `${round}|${type}` for our own votes
     this.proposed = new Set(); // rounds we proposed in
   }
@@ -68,6 +69,29 @@ export class Consensus {
   advance(round) {
     this.round = round;
     this.roundStarted = Date.now();
+  }
+
+  // Skip rule: move to the largest round r > current such that validators holding more than one third
+  // of the weight have spoken in round r or later. At least one of them is honest, so the round is live.
+  maybeSkip() {
+    const { weights } = this.vset;
+    const candidates = [...new Set([...this.seen.values()])]
+      .filter((r) => r > this.round)
+      .sort((a, b) => b - a);
+    for (const r of candidates) {
+      let power = 0n;
+      for (const [validator, seenRound] of this.seen) {
+        if (seenRound >= r) power += weights.get(validator);
+      }
+      if (hasOneThird(power, this.vset.total)) {
+        this.advance(r);
+        return;
+      }
+    }
+  }
+
+  noteSeen(validator, round) {
+    if (!this.seen.has(validator) || this.seen.get(validator) < round) this.seen.set(validator, round);
   }
 
   async tick() {
@@ -121,8 +145,11 @@ export class Consensus {
     this.ensureHeight();
     if (p.height > this.height) return "behind";
     if (p.height < this.height) return "stale";
-    if (!isRound(p.round) || !Number.isInteger(p.polkaRound) || p.polkaRound < -1 || p.polkaRound >= p.round) {
+    if (!isRound(p.round) || p.round > this.round + MAX_ROUND_AHEAD) {
       throw new ChainError("BAD_PROPOSAL", "رقم الجولة في الاقتراح غير صالح.");
+    }
+    if (!Number.isInteger(p.polkaRound) || p.polkaRound < -1 || p.polkaRound >= p.round) {
+      throw new ChainError("BAD_PROPOSAL", "إثبات الأغلبية في الاقتراح غير صالح.");
     }
     if (p.block === null || typeof p.block !== "object" || typeof p.block.hash !== "string") {
       throw new ChainError("BAD_BLOCK", "الكتلة المقترحة غير صالحة.");
@@ -141,18 +168,19 @@ export class Consensus {
     const state = await applyBlock(this.node.state, p.block, { height: tip.height, hash: tip.hash }, this.node.genesis);
     this.proposals.set(p.round, p);
     this.blocks.set(p.block.hash, { block: p.block, state });
-    if (p.round > this.round) this.advance(p.round);
+    this.noteSeen(p.from, p.round);
+    this.maybeSkip();
     await this.step();
     return "new";
   }
 
-  // A polka is a prevote quorum for one block in an earlier round. It is checked before any reliance on it.
+  // A polka is a prevote quorum for one block in an earlier round. It is checked before anyone relies on it.
   async verifyPolka(blockHash, round, sigs) {
     if (!Array.isArray(sigs)) throw new ChainError("BAD_POLKA", "شكل إثبات الأغلبية غير صالح.");
     const { weights, total } = this.vset;
     const message = voteMessage(this.chainId, "prevote", this.height, round, blockHash);
     const seen = new Set();
-    let power = 0;
+    let power = 0n;
     for (const entry of sigs) {
       const validator = entry?.validator;
       if (!weights.has(validator) || seen.has(validator)) {
@@ -177,6 +205,7 @@ export class Consensus {
     if ((v.type !== "prevote" && v.type !== "precommit") || !isRound(v.round)) {
       throw new ChainError("BAD_VOTE", "نوع التصويت أو رقم الجولة غير صالح.");
     }
+    if (v.round > this.round + MAX_ROUND_AHEAD) throw new ChainError("BAD_VOTE", "رقم الجولة بعيد جداً.");
     if (v.blockHash !== NIL && !(typeof v.blockHash === "string" && HASH.test(v.blockHash))) {
       throw new ChainError("BAD_VOTE", "هدف التصويت غير صالح.");
     }
@@ -186,12 +215,16 @@ export class Consensus {
       throw new ChainError("BAD_SIGNATURE", "توقيع التصويت غير صحيح.");
     }
     const result = await this.record(v);
-    if (result === "new") await this.step();
+    if (result === "new") {
+      this.noteSeen(v.validator, v.round);
+      this.maybeSkip();
+      await this.step();
+    }
     return result;
   }
 
-  // Stores a verified vote. A second, different precommit from the same validator is double signing:
-  // the two signed votes become evidence, which the node gossips and includes in a later block.
+  // Stores a verified vote. A second, different vote of the same type from one validator in the same round
+  // is double signing. The two signed votes become evidence, which the node gossips and includes in a block.
   async record(v) {
     const key = `${v.round}|${v.type}`;
     if (!this.votes.has(key)) this.votes.set(key, new Map());
@@ -199,25 +232,23 @@ export class Consensus {
     const prior = map.get(v.validator);
     if (prior) {
       if (prior.blockHash === v.blockHash) return "duplicate";
-      if (v.type === "precommit") {
-        try {
-          await this.node.receiveEvidence({
-            validator: v.validator,
-            height: this.height,
-            round: v.round,
-            blockA: prior.blockHash,
-            signatureA: prior.signature,
-            blockB: v.blockHash,
-            signatureB: v.signature,
-          });
-        } catch {
-          /* evidence that does not verify is not stored */
-        }
+      try {
+        await this.node.receiveEvidence({
+          type: v.type,
+          validator: v.validator,
+          height: this.height,
+          round: v.round,
+          blockA: prior.blockHash,
+          signatureA: prior.signature,
+          blockB: v.blockHash,
+          signatureB: v.signature,
+        });
+      } catch {
+        /* evidence that does not verify is not stored */
       }
       return "conflict";
     }
     map.set(v.validator, { blockHash: v.blockHash, signature: v.signature });
-    if (v.round > this.round) this.advance(v.round);
     return "new";
   }
 
@@ -242,7 +273,7 @@ export class Consensus {
     const map = this.votes.get(`${round}|${type}`) ?? new Map();
     const groups = new Map();
     for (const [validator, { blockHash, signature }] of map) {
-      if (!groups.has(blockHash)) groups.set(blockHash, { blockHash, power: 0, signatures: [] });
+      if (!groups.has(blockHash)) groups.set(blockHash, { blockHash, power: 0n, signatures: [] });
       const group = groups.get(blockHash);
       group.power += this.vset.weights.get(validator);
       group.signatures.push({ validator, signature });

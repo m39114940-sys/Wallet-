@@ -51,6 +51,7 @@ const node = new ChainNode({
   dataDir: args.data,
   genesis,
   validator: { publicKey: validator.publicKey, privateKeyDer: validator.privateKeyDer },
+  tlsIdentity: { key: validator.tls.key, cert: validator.tls.cert },
   selfUrl: args.self ?? `https://${host}:${port}`,
   roundMs: Number(args["round-ms"] ?? 1000),
   log: (msg) => console.error(JSON.stringify({ event: "log", msg })),

@@ -29,7 +29,7 @@
 | كسر الأعداد | أعداد صحيحة (`BigInt`) للأوزان والحصص والمبالغ | `chain/weights.js`, `js/ledger.js` | `weights.test.js` |
 | نظراء مخترَعون من الشبكة | قائمة النظراء من الإعداد فقط؛ لا ترويسة ولا `/peers` تضيف نظيراً | `node/node.js` `addPeer` | `network.test.js` |
 | مزامنة من عنوان غير معتمد | `/sync` و`syncIfDue` يرفضان أي عنوان خارج القائمة | `node/node.js` | `network.test.js` |
-| اتصال منتحل أو تنصت | TLS مع بصمة SPKI معتمدة في التأسيس، والتحقق قبل إرسال أي جسم طلب | `node/tls.js` `peerRequest` | `tls.test.js`, `network.test.js` |
+| اتصال منتحل أو تنصت | TLS 1.3 فقط مع بصمة SPKI معتمدة في التأسيس، وتحقق متبادل: الخادم يطلب شهادة العميل ويسقط أي اتصال ببصمة غير معتمدة قبل معالجة الطلب، والتحقق قبل إرسال أي جسم طلب | `node/tls.js` `peerRequest` و`isPinnedSocket`، و`node/node.js` `createHttpServer` | `tls.test.js`, `network.test.js` |
 | كتلة بطابع زمني شاذ | طابع يزيد صارماً عن الأب، وحد انحراف 15 ثانية للكتل الجديدة | `chain/core.js`, `chain/consensus.js` | `chain.test.js` |
 | استجابة مزامنة ضخمة | صفحات من 200 كتلة، وسقف 100000 كتلة للمزامنة | `node/node.js` | — |
 

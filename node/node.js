@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "
 import { join } from "node:path";
 import http from "node:http";
 import https from "node:https";
-import { peerRequest } from "./tls.js";
+import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
@@ -45,7 +45,8 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, selfUrl = null, roundMs = 1000, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, selfUrl = null, roundMs = 1000, log = () => {} }) {
+    this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
     this.dataDir = dataDir;
     this.genesis = genesis;
     this.validator = validator;
@@ -183,6 +184,7 @@ export class ChainNode {
       body,
       headers: { "x-peer-url": this.selfUrl ?? "", ...headers },
       pins: this.pins,
+      identity: this.tlsIdentity,
       timeoutMs: PEER_TIMEOUT_MS,
     });
     return res.status === 200;
@@ -351,6 +353,7 @@ export class ChainNode {
         url,
         path: `/blocks?from=${from}&limit=${MAX_PAGE}`,
         pins: this.pins,
+        identity: this.tlsIdentity,
         timeoutMs: 10_000,
       });
       if (res.status !== 200) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
@@ -483,5 +486,15 @@ export function createHttpServer(node, tlsOptions = null) {
       });
     }
   };
-  return tlsOptions ? https.createServer(tlsOptions, handler) : http.createServer(handler);
+  if (!tlsOptions) return http.createServer(handler);
+  // Mutual TLS: the server asks for a client certificate, and drops any connection whose
+  // certificate fingerprint is not a validator pin, before any HTTP bytes are parsed.
+  const server = https.createServer(
+    { ...tlsOptions, ...TLS_VERSION_OPTIONS, requestCert: true, rejectUnauthorized: false },
+    handler,
+  );
+  server.prependListener("secureConnection", (socket) => {
+    if (!isPinnedSocket(socket, node.pins)) socket.destroy();
+  });
+  return server;
 }

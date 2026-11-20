@@ -14,7 +14,7 @@ import { initNetwork } from "../node/tools.js";
 import { buildBlock, voteMessage } from "../chain/core.js";
 import { signText } from "../chain/crypto.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
-import { peerRequest } from "../node/tls.js";
+import { peerRequest, createTlsIdentity } from "../node/tls.js";
 
 const CLI = fileURLToPath(new URL("../node/cli.js", import.meta.url));
 const CHAIN = "snn-testnet-itest";
@@ -25,6 +25,7 @@ let alice;
 let bob;
 let validators;
 let pins;
+let clientId; // validator 0's identity, presented as the client certificate
 let nodes;
 
 function freePort() {
@@ -56,12 +57,12 @@ function startNode(name, port, validatorIndex, peerUrls) {
 }
 
 async function get(node, path) {
-  const res = await peerRequest({ url: node.url, path, pins });
+  const res = await peerRequest({ url: node.url, path, pins, identity: clientId });
   return { status: res.status, body: res.body };
 }
 
 async function post(node, path, body, headers = {}) {
-  const res = await peerRequest({ url: node.url, method: "POST", path, body, headers, pins });
+  const res = await peerRequest({ url: node.url, method: "POST", path, body, headers, pins, identity: clientId });
   return { status: res.status, body: res.body };
 }
 
@@ -106,6 +107,7 @@ before(async () => {
   bob = await makeAccount();
   ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address]));
   pins = new Set(validators.map((v) => v.tls.fingerprint));
+  clientId = { key: validators[0].tls.key, cert: validators[0].tls.cert };
 });
 
 after(() => {
@@ -202,9 +204,15 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
 
   // 7. Peers cannot be added from the network. A forged header adds nothing, /peers is gone,
   //    and /sync refuses any address that the operator did not configure.
-  await peerRequest({ url: v1.url, path: "/status", headers: { "x-peer-url": "https://127.0.0.1:1" }, pins });
+  await peerRequest({ url: v1.url, path: "/status", headers: { "x-peer-url": "https://127.0.0.1:1" }, pins, identity: clientId });
   await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins: new Set(["0".repeat(64)]) }), { code: "TLS_PIN_MISMATCH" });
   assert.ok(!(await get(v1, "/status")).body.peers.includes("https://127.0.0.1:1"));
+
+  // Mutual TLS: a client certificate that is not a validator pin is dropped by the server, and so is
+  // a client that presents no certificate at all. Both fail before any request is processed.
+  const outsider = createTlsIdentity("outsider-node");
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins, identity: outsider }));
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins }));
   assert.equal((await post(v1, "/peers", { url: "https://127.0.0.1:1" })).status, 404);
   const foreignSync = await post(v1, "/sync", { url: "https://127.0.0.1:1" });
   assert.equal(foreignSync.status, 400);

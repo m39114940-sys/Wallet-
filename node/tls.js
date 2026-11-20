@@ -14,6 +14,9 @@ import { ChainError } from "../chain/core.js";
 
 const MAX_RESPONSE_BYTES = 8_000_000;
 
+// Both sides of every validator connection use TLS 1.3 only.
+export const TLS_VERSION_OPTIONS = { minVersion: "TLSv1.3", maxVersion: "TLSv1.3" };
+
 // Fingerprint = SHA-256 of the DER-encoded SubjectPublicKeyInfo. Matches `openssl pkey -pubin -outform DER`.
 export function fingerprintOfCertificate(certificate) {
   const spki = certificate.publicKey.export({ type: "spki", format: "der" });
@@ -41,10 +44,18 @@ export function createTlsIdentity(commonName) {
   }
 }
 
+// True only if the connected client presented a certificate whose fingerprint is pinned.
+export function isPinnedSocket(socket, pins) {
+  const raw = socket.getPeerCertificate?.().raw;
+  if (!raw) return false;
+  return pins.has(fingerprintOfCertificate(new X509Certificate(raw)));
+}
+
 // Sends one JSON request to a peer over HTTPS, pinned to `pins` (a Set of fingerprints).
 // Resolves with { status, body }. Rejects with TLS_PIN_MISMATCH if the certificate is not pinned,
 // and in that case no request bytes leave the process.
-export function peerRequest({ url, method = "GET", path, body, headers = {}, pins, timeoutMs = 3000 }) {
+// identity: { key, cert } of this validator, presented as the client certificate (mutual TLS).
+export function peerRequest({ url, method = "GET", path, body, headers = {}, pins, identity = null, timeoutMs = 3000 }) {
   const target = new URL(path, url);
   if (target.protocol !== "https:") {
     return Promise.reject(new ChainError("INSECURE_PEER", "النظير يجب أن يُخدم عبر https."));
@@ -65,6 +76,8 @@ export function peerRequest({ url, method = "GET", path, body, headers = {}, pin
         method,
         headers: sendHeaders,
         agent: false,
+        ...TLS_VERSION_OPTIONS,
+        ...(identity ? { key: identity.key, cert: identity.cert } : {}),
         // Verification is done by the pin below, not by a certificate authority.
         rejectUnauthorized: false,
         timeout: timeoutMs,

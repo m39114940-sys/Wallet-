@@ -1,24 +1,29 @@
-// Integration test: real node processes, real HTTP, real signatures.
-// One producer and two followers run as separate OS processes. A follower is killed and restarted.
+// Integration test: four real validator processes over real HTTP, with real signatures.
+// Covers: agreement on certified blocks, a crash that the chain survives, refused forged and tampered
+// blocks, double-sign evidence that slashes and jails, a halt when too few validators are alive,
+// and a restarted validator catching up from its own disk and its peers.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { initNetwork } from "../node/tools.js";
-import { buildBlock, genesisBlock } from "../chain/core.js";
-import { toHex } from "../js/signing.js";
+import { buildBlock, voteMessage } from "../chain/core.js";
+import { signText } from "../chain/crypto.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
 
 const CLI = fileURLToPath(new URL("../node/cli.js", import.meta.url));
-const procs = [];
+const CHAIN = "snn-testnet-itest";
+const ROUND_MS = 600;
+const procs = new Map(); // name -> child process
 let dir;
 let alice;
 let bob;
-let net_;
+let validators;
+let nodes;
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -32,14 +37,20 @@ function freePort() {
   });
 }
 
-function startNode({ name, port, peers = [], producer = false }) {
-  const args = [CLI, "--port", String(port), "--data", join(dir, name), "--genesis", join(dir, "genesis.json")];
-  if (producer) args.push("--producer-key", join(dir, "producer.json"));
-  for (const p of peers) args.push("--peer", p);
+function startNode(name, port, validatorIndex, peerUrls) {
+  const args = [
+    CLI,
+    "--port", String(port),
+    "--data", join(dir, name),
+    "--genesis", join(dir, "genesis.json"),
+    "--validator-key", join(dir, `validator-${validatorIndex}.json`),
+    "--round-ms", String(ROUND_MS),
+  ];
+  for (const p of peerUrls) args.push("--peer", p);
   const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
   child.stderr.on("data", (d) => process.env.SNN_TEST_DEBUG && process.stderr.write(d));
-  procs.push(child);
-  return { name, port, url: `http://127.0.0.1:${port}`, child, args };
+  procs.set(name, child);
+  return { name, url: `http://127.0.0.1:${port}` };
 }
 
 async function get(node, path) {
@@ -56,7 +67,7 @@ async function post(node, path, body) {
   return { status: res.status, body: await res.json() };
 }
 
-async function waitFor(predicate, label, timeoutMs = 15_000) {
+async function waitFor(predicate, label, timeoutMs = 30_000) {
   const started = Date.now();
   let last;
   while (Date.now() - started < timeoutMs) {
@@ -66,128 +77,126 @@ async function waitFor(predicate, label, timeoutMs = 15_000) {
     } catch {
       /* node not up yet */
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error(`timed out waiting for ${label}`);
 }
 
 const height = async (node) => (await get(node, "/status")).body.height;
+const balanceUnits = async (node, address) => (await get(node, `/balance?address=${address}`)).body.units;
+
+async function killNode(name) {
+  const child = procs.get(name);
+  child.kill("SIGTERM");
+  await new Promise((r) => child.once("exit", r));
+}
+
+// A certificate signed by the given validator indexes, for a block the test builds itself.
+async function certifiedBlock(block, round, signers) {
+  const signatures = [];
+  for (const i of signers) {
+    const v = validators[i - 1];
+    const message = voteMessage(CHAIN, "precommit", block.height, round, block.hash);
+    signatures.push({ validator: v.publicKey, signature: await signText(v.privateKeyDer, message) });
+  }
+  return { ...block, certificate: { round, signatures } };
+}
 
 before(async () => {
   dir = mkdtempSync(join(tmpdir(), "snn-net-"));
   alice = await makeAccount();
   bob = await makeAccount();
-  await initNetwork(dir, "snn-testnet-itest", [alice.address, bob.address]);
+  ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address]));
 });
 
 after(() => {
-  for (const child of procs) child.kill("SIGTERM");
+  for (const child of procs.values()) child.kill("SIGTERM");
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("three real processes reach the same chain, with gossip, forgery rejection and restart sync", async () => {
-  const pPort = await freePort();
-  const f1Port = await freePort();
-  const f2Port = await freePort();
-  const producer = startNode({ name: "producer", port: pPort, producer: true });
-  const f1 = startNode({ name: "f1", port: f1Port, peers: [producer.url] });
-  let f2 = startNode({ name: "f2", port: f2Port, peers: [producer.url] });
-  net_ = { producer, f1, f2 };
+test("four validators agree on certified blocks, survive a crash, and punish double signing", async () => {
+  const ports = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
+  const urls = ports.map((p) => `http://127.0.0.1:${p}`);
+  // Full mesh: every validator knows every other one from the start.
+  nodes = ports.map((port, i) =>
+    startNode(`v${i + 1}`, port, i + 1, urls.filter((_, j) => j !== i)),
+  );
+  const [v1, v2, v3, v4] = nodes;
+  for (const n of nodes) await waitFor(() => get(n, "/status"), `${n.name} up`);
 
-  await waitFor(() => get(producer, "/status"), "producer up");
-  await waitFor(() => get(f1, "/status"), "f1 up");
-  await waitFor(() => get(f2, "/status"), "f2 up");
-
-  // The producer learns about the followers, so blocks reach them.
-  await post(producer, "/peers", { url: f1.url });
-  await post(producer, "/peers", { url: f2.url });
-
-  // 1. Alice pays Bob through follower f1. f1 gossips it to the producer.
+  // 1. A transfer through validator 1 is gossiped, certified by a quorum, and seen by everyone.
   const pay = await signedTransfer(alice, bob.address, "3", 0);
-  const accepted = await post(f1, "/tx", pay);
-  assert.equal(accepted.status, 200);
-  await waitFor(async () => (await get(producer, "/status")).body.mempool === 1, "tx gossiped to producer");
+  assert.equal((await post(v1, "/tx", pay)).status, 200);
+  await waitFor(async () => (await balanceUnits(v4, bob.address)) === "103000000", "block 1 on v4");
+  await waitFor(async () => (await height(v1)) === 1 && (await height(v2)) === 1 && (await height(v3)) === 1, "height 1 everywhere");
+  const block1 = (await get(v3, "/blocks?from=1")).body[0];
+  assert.ok(block1.certificate.signatures.length >= 3, "block carries a quorum certificate");
+  assert.equal((await get(v1, "/status")).body.tipHash, (await get(v4, "/status")).body.tipHash);
 
-  // 2. The producer seals a block. Both followers receive it over HTTP.
-  const produced = await post(producer, "/produce", {});
-  assert.equal(produced.body.height, 1);
-  await waitFor(async () => (await height(f1)) === 1 && (await height(f2)) === 1, "block 1 propagated");
-
-  const bobOnF2 = await get(f2, `/balance?address=${bob.address}`);
-  assert.equal(bobOnF2.body.units, "103000000"); // 100 from genesis plus the 3 sent
-  assert.equal((await get(f2, "/status")).body.tipHash, (await get(producer, "/status")).body.tipHash);
-
-  // 3. Replaying the same signed transfer is rejected by the nonce.
-  const replay = await post(f2, "/tx", pay);
+  // 2. Forgeries are refused: a replayed transfer, a changed amount, and a block with one signature only.
+  const replay = await post(v2, "/tx", pay);
   assert.equal(replay.status, 400);
   assert.equal(replay.body.code, "NONCE_MISMATCH");
-
-  // 4. A forged transfer is rejected by the signature check.
-  const forged = await post(f1, "/tx", { ...pay, amount: "300" });
-  assert.equal(forged.status, 400);
+  const forged = await post(v1, "/tx", { ...pay, amount: "300" });
   assert.equal(forged.body.code, "BAD_SIGNATURE");
 
-  // 5. A block signed by a non-producer key is rejected, even with valid internal structure.
-  const attackerBlock = await buildBlock({
-    height: 2,
-    timestamp: Math.floor(Date.now() / 1000),
-    prevHash: (await get(f1, "/status")).body.tipHash,
-    txs: [],
-    producer: toHex(alice.publicKey),
-    privateKeyDerHex: toHex(alice.privateKeyDer),
-  });
-  const forgedBlock = await post(f1, "/block", attackerBlock);
-  assert.equal(forgedBlock.status, 400);
-  assert.equal(forgedBlock.body.code, "BAD_PRODUCER");
-  assert.equal(await height(f1), 1);
+  const tip = (await get(v1, "/status")).body;
+  const honest = await certifiedBlock(
+    buildBlock({ height: tip.height + 1, timestamp: Math.floor(Date.now() / 1000), prevHash: tip.tipHash, txs: [] }),
+    0,
+    [1, 2, 3],
+  );
+  const oneSigner = { ...honest, certificate: { round: 0, signatures: [honest.certificate.signatures[0]] } };
+  const noQuorum = await post(v1, "/block", oneSigner);
+  assert.equal(noQuorum.status, 400);
+  assert.equal(noQuorum.body.code, "NO_QUORUM");
+  assert.equal(await height(v1), tip.height, "refused blocks do not move the chain");
 
-  // 6. Follower f2 goes down. The producer keeps sealing blocks.
-  f2.child.kill("SIGTERM");
-  await new Promise((r) => f2.child.once("exit", r));
+  // 3. Validator 4 goes down. Three of four is more than two thirds, so the chain keeps going.
+  await killNode("v4");
   const pay2 = await signedTransfer(bob, alice.address, "1", 0);
-  assert.equal((await post(producer, "/tx", pay2)).status, 200);
-  assert.equal((await post(producer, "/produce", {})).body.height, 2);
-  assert.equal(await height(f1), 2);
+  assert.equal((await post(v2, "/tx", pay2)).status, 200);
+  await waitFor(async () => (await balanceUnits(v3, alice.address)) === "98000000", "payment with v4 down");
+  assert.equal(await balanceUnits(v1, alice.address), "98000000");
 
-  // 7. f2 restarts from its own disk and syncs the missing block from the producer.
-  f2 = startNode({ name: "f2", port: f2Port, peers: [producer.url] });
-  net_.f2 = f2;
-  await waitFor(() => get(f2, "/status"), "f2 back up");
-  await waitFor(async () => (await height(f2)) === 2, "f2 synced to height 2");
-  assert.equal(
-    (await get(f2, `/balance?address=${alice.address}`)).body.units,
-    (await get(producer, `/balance?address=${alice.address}`)).body.units,
-  );
-});
+  // 4. Double signing: validator 4 signs two different precommits for height 1. Evidence is gossiped,
+  //    included in a block, and the validator loses 5% of its stake and is jailed.
+  const culprit = validators[3];
+  const sign = (target) => signText(culprit.privateKeyDer, voteMessage(CHAIN, "precommit", 1, 0, target));
+  const blockA = "a".repeat(64);
+  const blockB = "b".repeat(64);
+  const evidence = {
+    validator: culprit.publicKey,
+    height: 1,
+    round: 0,
+    blockA,
+    signatureA: await sign(blockA),
+    blockB,
+    signatureB: await sign(blockB),
+  };
+  assert.equal((await post(v2, "/evidence", evidence)).status, 200);
+  const jailed = async (node) => {
+    const info = (await get(node, "/validators")).body.validators;
+    return info.find((v) => v.publicKey === culprit.publicKey);
+  };
+  await waitFor(async () => (await jailed(v1))?.jailed === true, "validator 4 jailed on v1");
+  await waitFor(async () => (await jailed(v3))?.jailed === true, "validator 4 jailed on v3");
+  assert.equal((await jailed(v1)).stake, "950000000");
 
-test("a block from the producer with a tampered transaction is refused by the network", async () => {
-  const status = (await get(net_.f1, "/status")).body;
-  const tip = await get(net_.f1, `/blocks?from=${status.height}`);
-  const genesis = genesisBlock({
-    chainId: "snn-testnet-itest",
-    timestamp: (await get(net_.f1, "/blocks?from=0")).body[0].timestamp,
-    producerPublicKey: status.producerPublicKey,
-    allocations: [alice.address, bob.address].sort(),
-  });
-  assert.equal(genesis.hash, (await get(net_.f1, "/blocks?from=0")).body[0].hash, "genesis agrees with the network");
-  assert.ok(tip.body.length >= 1);
+  // 5. With validator 4 jailed, three active validators remain, and all of them are needed.
+  //    Stopping one of them leaves two, which is not enough, so the chain must halt, not split.
+  await killNode("v3");
+  const before_ = await height(v1);
+  await new Promise((r) => setTimeout(r, 3_000));
+  assert.equal(await height(v1), before_, "two active validators cannot finalize");
 
-  // Build the next block honestly with the real producer key, then alter it before sending.
-  const producerKey = JSON.parse(
-    (await import("node:fs")).readFileSync(join(dir, "producer.json"), "utf8"),
-  );
-  const pay = await signedTransfer(alice, bob.address, "5", 1);
-  const block = await buildBlock({
-    height: status.height + 1,
-    timestamp: Math.floor(Date.now() / 1000),
-    prevHash: status.tipHash,
-    txs: [pay],
-    producer: status.producerPublicKey,
-    privateKeyDerHex: producerKey.privateKeyDer,
-  });
-  block.txs[0] = { ...block.txs[0], amount: "500" };
-  const res = await post(net_.f1, "/block", block);
-  assert.equal(res.status, 400);
-  assert.equal(res.body.code, "BAD_MERKLE");
-  assert.equal(await height(net_.f1), status.height);
+  // 6. Validator 3 restarts from its own disk and catches up with the peers.
+  startNode("v3", ports[2], 3, [urls[0], urls[1]]);
+  await waitFor(() => get(v3, "/status"), "v3 back up");
+  const pay3 = await signedTransfer(alice, bob.address, "2", 1);
+  assert.equal((await post(v1, "/tx", pay3)).status, 200);
+  await waitFor(async () => (await balanceUnits(v3, bob.address)) === "104000000", "payment after restart on v3");
+  await waitFor(async () => (await height(v2)) === (await height(v3)), "v2 and v3 at one height");
+  assert.equal(await balanceUnits(v2, alice.address), "96000000");
+  assert.equal((await get(v1, "/status")).body.tipHash, (await get(v2, "/status")).body.tipHash);
 });

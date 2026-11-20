@@ -1,10 +1,12 @@
-// SNN network node (Phase 3 basics): persistent chain, mempool, gossip, and sync over HTTP.
-// Nothing here trusts a peer: every block and transaction is validated before it is accepted.
+// SNN network node: persistent chain, mempool, gossip, sync over HTTP, and multi-validator consensus.
+// Nothing here trusts a peer: every block, proposal, vote and piece of evidence is verified before use.
 //
-// Limits of this step (documented in docs/network.md):
-// - One designated producer creates blocks. This is temporary; Phase 4 replaces it with multi-validator consensus.
+// Limits (documented in docs/network.md):
 // - Plain HTTP, no authentication, no rate limiting. Suitable for local and test networks only.
-// - The producer's private key is read from a local file. Use a hardware or OS keystore before any real use.
+// - Validator keys are read from local JSON files in plain text. Use an OS or hardware keystore before real use.
+// - Proposer order is predictable (no VRF yet), so a known proposer can be targeted.
+// - Messages are not retransmitted. Liveness relies on round timeouts and fresh votes.
+// - Each node sends the full chain on sync. There is no pruning or snapshot.
 
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -12,31 +14,66 @@ import http from "node:http";
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
-  applyBlock,
+  applyCommitted,
   buildBlock,
   cloneState,
+  evidenceKey,
   genesisBlock,
   genesisState,
+  normalizeEvidence,
   normalizeTx,
   replayChain,
   txId,
-  canonicalJson,
+  verifyEvidence,
 } from "../chain/core.js";
+import { Consensus } from "../chain/consensus.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
 const MAX_MEMPOOL = 5000;
+const TICK_MS = 50;
+
+const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
-  constructor({ dataDir, genesis, producer = null, selfUrl = null }) {
+  // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
+  constructor({ dataDir, genesis, validator = null, selfUrl = null, roundMs = 1000, log = () => {} }) {
     this.dataDir = dataDir;
     this.genesis = genesis;
-    this.producer = producer; // { privateKeyDer (hex), publicKey (hex) } or null for a follower
+    this.validator = validator;
     this.selfUrl = selfUrl;
+    this.log = log;
     this.peers = new Set();
     this.blocks = [];
     this.state = null;
     this.mempool = new Map();
+    this.evidence = new Map(); // evidenceKey -> verified evidence, waiting for a block
+    this.queue = Promise.resolve();
+    this.consensus = new Consensus({ node: this, keys: validator, roundMs });
+    this.timer = null;
+    this.lastError = null;
+  }
+
+  // Every state change runs through this queue, so no two handlers interleave across awaits.
+  run(fn) {
+    const result = this.queue.then(fn);
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
+  start() {
+    this.timer = setInterval(() => {
+      this.run(() => this.consensus.tick()).catch((err) => {
+        // The same error would repeat every tick, so log it only when it changes.
+        if (err.message !== this.lastError) this.log(`consensus: ${err.message}`);
+        this.lastError = err.message;
+      });
+    }, TICK_MS);
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
   }
 
   // ---------- Startup and persistence ----------
@@ -51,7 +88,7 @@ export class ChainNode {
       return;
     }
     const stored = JSON.parse(readFileSync(chainPath, "utf8"));
-    // A stored chain is accepted only if it replays from genesis. Otherwise the node refuses to start.
+    // A stored chain is accepted only if it replays from genesis with valid certificates.
     this.state = await replayChain(stored.blocks, this.genesis);
     this.blocks = stored.blocks;
   }
@@ -72,10 +109,22 @@ export class ChainNode {
       chainId: this.genesis.chainId,
       height: this.tip.height,
       tipHash: this.tip.hash,
-      producer: this.producer !== null,
-      producerPublicKey: this.genesis.producerPublicKey,
+      validator: this.validator !== null,
+      validatorPublicKey: this.validator?.publicKey ?? null,
+      round: this.consensus.height === this.tip.height + 1 ? this.consensus.round : null,
       peers: [...this.peers],
       mempool: this.mempool.size,
+      evidence: this.evidence.size,
+    };
+  }
+
+  validatorsInfo() {
+    return {
+      validators: [...this.state.stakes].map(([publicKey, stake]) => ({
+        publicKey,
+        stake: stake.toString(),
+        jailed: this.state.jailed.has(publicKey),
+      })),
     };
   }
 
@@ -84,7 +133,11 @@ export class ChainNode {
   }
 
   balance(address) {
-    return { address, units: this.state.balanceOf(address).toString(), nonce: this.state.nextNonce(address) };
+    return {
+      address,
+      units: this.state.ledger.balanceOf(address).toString(),
+      nonce: this.state.ledger.nextNonce(address),
+    };
   }
 
   // ---------- Peers and gossip ----------
@@ -113,6 +166,11 @@ export class ChainNode {
     );
   }
 
+  // Fire and forget: the queue never waits for the network.
+  gossip(path, body, exceptUrl = null) {
+    this.broadcast(path, body, exceptUrl).catch(() => {});
+  }
+
   // ---------- Transactions ----------
 
   async submitTx(raw) {
@@ -123,48 +181,97 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
-    await trial.transfer(tx); // throws LedgerError with a specific code if invalid
+    await trial.ledger.transfer(tx); // throws LedgerError with a specific code if invalid
 
     this.mempool.set(id, tx);
-    await this.broadcast("/tx", tx);
+    this.gossip("/tx", tx);
     return { txId: id, status: "accepted" };
   }
 
-  // ---------- Blocks ----------
+  hasPendingWork() {
+    return this.mempool.size > 0 || this.evidence.size > 0;
+  }
 
-  async produce() {
-    if (!this.producer) throw new ChainError("NOT_PRODUCER", "هذه العقدة ليست منتجة للكتل.");
-
+  // Builds the next block from the mempool, keeping only transactions that apply in order.
+  async assemble(evidence) {
     const trial = await cloneState(this.state);
     const included = [];
     for (const tx of this.mempool.values()) {
       try {
-        await trial.transfer(tx);
+        await trial.ledger.transfer(tx);
         included.push(tx);
       } catch {
-        // Invalid after earlier transactions in this block: leave it out. It is pruned below.
+        // Invalid after earlier transactions in this block. It is pruned after the commit.
       }
     }
-
-    const block = await buildBlock({
+    return buildBlock({
       height: this.tip.height + 1,
       timestamp: Math.floor(Date.now() / 1000),
       prevHash: this.tip.hash,
       txs: included,
-      producer: this.genesis.producerPublicKey,
-      privateKeyDerHex: this.producer.privateKeyDer,
+      evidence,
     });
-    this.commit(block, trial);
-    await this.broadcast("/block", block);
-    return { height: block.height, hash: block.hash, txs: block.txs.length };
   }
 
-  commit(block, state) {
+  // ---------- Evidence ----------
+
+  // Evidence that can be included in a block at `height`: one per validator, and only while still active.
+  async pendingEvidence(height) {
+    const chosen = [];
+    const seen = new Set();
+    for (const ev of [...this.evidence.values()].sort(byEvidenceKey)) {
+      if (seen.has(ev.validator) || ev.height >= height) continue;
+      try {
+        await verifyEvidence(ev, this.genesis.chainId, this.state);
+      } catch {
+        continue;
+      }
+      seen.add(ev.validator);
+      chosen.push(ev);
+    }
+    return chosen;
+  }
+
+  async receiveEvidence(raw, fromUrl = null) {
+    const ev = normalizeEvidence(raw);
+    const key = evidenceKey(ev);
+    if (this.evidence.has(key)) return { status: "known" };
+    if (ev.height > this.tip.height + 1) throw new ChainError("BAD_EVIDENCE", "الدليل يخص ارتفاعاً مستقبلياً.");
+    await verifyEvidence(ev, this.genesis.chainId, this.state);
+    this.evidence.set(key, ev);
+    this.gossip("/evidence", ev, fromUrl);
+    return { status: "accepted" };
+  }
+
+  // ---------- Consensus messages from peers ----------
+
+  async receiveConsensus(kind, payload, fromUrl) {
+    if (kind === "proposal") {
+      const result = await this.consensus.onProposal(payload);
+      if (result === "behind" && fromUrl) await this.sync(fromUrl);
+      if (result === "new") this.gossip("/consensus", { kind, payload }, fromUrl);
+      return { result };
+    }
+    if (kind === "vote") {
+      const result = await this.consensus.onVote(payload);
+      if (result === "behind" && fromUrl) await this.sync(fromUrl);
+      if (result === "new") this.gossip("/consensus", { kind, payload }, fromUrl);
+      return { result };
+    }
+    throw new ChainError("BAD_KIND", "نوع رسالة الإجماع غير معروف.");
+  }
+
+  // Called by the consensus engine when a block gets a quorum of precommits.
+  async commitBlock(block, state) {
     this.blocks.push(block);
     this.state = state;
     for (const tx of block.txs) this.mempool.delete(txId(tx));
-    this.pruneMempool();
+    for (const ev of block.evidence) this.evidence.delete(evidenceKey(ev));
+    for (const [key, ev] of this.evidence) {
+      if (state.jailed.has(ev.validator)) this.evidence.delete(key);
+    }
     this.persist();
+    await this.pruneMempool();
   }
 
   // Drops mempool entries that no longer apply after a block changed the state.
@@ -172,22 +279,22 @@ export class ChainNode {
     const trial = await cloneState(this.state);
     for (const [id, tx] of [...this.mempool]) {
       try {
-        await trial.transfer(tx);
+        await trial.ledger.transfer(tx);
       } catch {
         this.mempool.delete(id);
       }
     }
   }
 
-  // Accepts a block from a peer. Blocks that extend our tip are validated and applied.
-  // A block far ahead or on a different fork triggers a full sync from that peer.
+  // ---------- Certified blocks from peers ----------
+
+  // Accepts a certified block that extends our tip. Certificates are checked by applyCommitted.
   async receiveBlock(block, fromUrl) {
     if (block === null || typeof block !== "object" || typeof block.height !== "number") {
       throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
     }
     if (block.height <= this.tip.height) {
-      const known = this.blocks[block.height];
-      if (known.hash === block.hash) return { accepted: false, reason: "known" };
+      if (this.blocks[block.height].hash === block.hash) return { accepted: false, reason: "known" };
       if (fromUrl) await this.sync(fromUrl).catch(() => null);
       return { accepted: false, reason: "conflicting block, sync requested" };
     }
@@ -195,10 +302,9 @@ export class ChainNode {
       if (fromUrl) await this.sync(fromUrl);
       return { accepted: false, reason: "behind, synced" };
     }
-
-    const state = await applyBlock(this.state, block, this.tip, this.genesis.producerPublicKey);
-    this.commit(block, state);
-    await this.broadcast("/block", block, fromUrl);
+    const state = await applyCommitted(this.state, block, this.tip, this.genesis);
+    await this.commitBlock(block, state);
+    this.gossip("/block", block, fromUrl);
     return { accepted: true, height: block.height };
   }
 
@@ -213,6 +319,9 @@ export class ChainNode {
     const state = await replayChain(blocks, this.genesis);
     this.blocks = blocks;
     this.state = state;
+    for (const [key, ev] of this.evidence) {
+      if (state.jailed.has(ev.validator)) this.evidence.delete(key);
+    }
     this.persist();
     await this.pruneMempool();
     return { adopted: true, height: this.tip.height };
@@ -248,13 +357,24 @@ async function readJson(req) {
   }
 }
 
+function requirePeerUrl(body) {
+  if (typeof body?.url !== "string" || !/^https?:\/\//.test(body.url)) {
+    throw new ChainError("BAD_PEER", "عنوان النظير غير صالح.");
+  }
+  return body.url;
+}
+
 export function createHttpServer(node) {
   return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://localhost");
       const { pathname } = url;
+      // Any peer that talks to us is added to our peer list, so a full mesh forms from partial knowledge.
+      const fromUrl = req.headers["x-peer-url"] || null;
+      if (fromUrl) node.addPeer(fromUrl);
 
       if (req.method === "GET" && pathname === "/status") return sendJson(res, 200, node.status());
+      if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);
         return sendJson(res, 200, node.blocksFrom(Number.isInteger(from) && from >= 0 ? from : 0));
@@ -263,34 +383,30 @@ export function createHttpServer(node) {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
       }
       if (req.method === "POST" && pathname === "/tx") {
-        const peerUrl = req.headers["x-peer-url"];
         const body = await readJson(req);
-        const result = await node.submitTx(body);
-        if (peerUrl) node.addPeer(peerUrl);
-        return sendJson(res, 200, result);
+        return sendJson(res, 200, await node.run(() => node.submitTx(body)));
       }
       if (req.method === "POST" && pathname === "/block") {
-        const fromUrl = req.headers["x-peer-url"] || null;
         const body = await readJson(req);
-        return sendJson(res, 200, await node.receiveBlock(body, fromUrl));
+        return sendJson(res, 200, await node.run(() => node.receiveBlock(body, fromUrl)));
       }
-      if (req.method === "POST" && pathname === "/produce") {
-        return sendJson(res, 200, await node.produce());
+      if (req.method === "POST" && pathname === "/consensus") {
+        const body = await readJson(req);
+        return sendJson(res, 200, await node.run(() => node.receiveConsensus(body?.kind, body?.payload, fromUrl)));
+      }
+      if (req.method === "POST" && pathname === "/evidence") {
+        const body = await readJson(req);
+        return sendJson(res, 200, await node.run(() => node.receiveEvidence(body, fromUrl)));
       }
       if (req.method === "POST" && pathname === "/peers") {
         const body = await readJson(req);
-        if (typeof body?.url !== "string" || !/^https?:\/\//.test(body.url)) {
-          throw new ChainError("BAD_PEER", "عنوان النظير غير صالح.");
-        }
-        node.addPeer(body.url);
+        node.addPeer(requirePeerUrl(body));
         return sendJson(res, 200, { peers: [...node.peers] });
       }
       if (req.method === "POST" && pathname === "/sync") {
         const body = await readJson(req);
-        if (typeof body?.url !== "string" || !/^https?:\/\//.test(body.url)) {
-          throw new ChainError("BAD_PEER", "عنوان النظير غير صالح.");
-        }
-        return sendJson(res, 200, await node.sync(body.url));
+        const peer = requirePeerUrl(body);
+        return sendJson(res, 200, await node.run(() => node.sync(peer)));
       }
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {

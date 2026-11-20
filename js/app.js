@@ -154,6 +154,7 @@ function showDashboard() {
 function start() {
   session = null;
   cancelPendingSend();
+  hideBackup();
   const hasWallet = Boolean(readStorage(KEYSTORE_KEY));
   showView(hasWallet ? "unlock" : "onboarding");
 }
@@ -347,30 +348,48 @@ $("#copy-address").addEventListener("click", async () => {
   }
 });
 
+// Removes the displayed backup text, so it does not stay on screen after the wallet is locked.
+function hideBackup() {
+  $("#backup").hidden = true;
+  $("#backup-text").value = "";
+}
+
 $("#lock").addEventListener("click", () => {
   session = null;
   cancelPendingSend();
+  hideBackup();
   $("#unlock-form").reset();
   setMessage($("#unlock-form"));
   showView("unlock");
   toast("تم قفل المحفظة", "ok");
 });
 
+// Shows the already-encrypted keystore as text. The plaintext key is never exported.
+// Text is used instead of a file download, because published pages cannot trigger downloads.
 $("#export").addEventListener("click", () => {
   const raw = readStorage(KEYSTORE_KEY);
   if (!session || !raw) {
-    toast("لا يوجد ملف محفظة لتنزيله.", "error");
+    toast("لا يوجد ملف محفظة لعرضه.", "error");
     return;
   }
-  // Downloads the already-encrypted keystore. The plaintext key is never exported.
-  const url = URL.createObjectURL(new Blob([raw], { type: "application/json" }));
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `snn-keystore-${session.address.slice(0, 12)}.json`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const panel = $("#backup");
+  const text = $("#backup-text");
+  text.value = JSON.stringify(JSON.parse(raw), null, 2);
+  panel.hidden = false;
+  text.focus();
+  text.select();
+});
+
+$("#copy-backup").addEventListener("click", async () => {
+  const text = $("#backup-text");
+  try {
+    await navigator.clipboard.writeText(text.value);
+    toast("تم نسخ النسخة الاحتياطية", "ok");
+  } catch {
+    text.focus();
+    text.select();
+    toast("انسخ النص يدوياً من الخانة", "error");
+  }
 });
 
 $("#reset").addEventListener("click", () => {

@@ -103,7 +103,12 @@
             </div>
             <div class="actions">
               <button id="lock" class="ghost" type="button">قفل المحفظة</button>
-              <button id="export" class="ghost" type="button">تنزيل الملف المشفّر</button>
+              <button id="export" class="ghost" type="button">عرض النسخة الاحتياطية</button>
+            </div>
+            <div id="backup" class="backup" hidden>
+              <p class="muted">هذا النص هو ملف المحفظة المشفّر بكلمة مرورك. احفظه في مكان آمن، ولا تشاركه مع أحد.</p>
+              <textarea id="backup-text" class="backup-text" readonly dir="ltr" rows="6" spellcheck="false"></textarea>
+              <button id="copy-backup" class="ghost" type="button">نسخ النص</button>
             </div>
           </div>
 

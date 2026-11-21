@@ -45,8 +45,9 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, selfUrl = null, roundMs = 1000, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
+    this.lossRate = lossRate; // TESTING ONLY: fraction of outbound peer requests dropped at random
     this.dataDir = dataDir;
     this.genesis = genesis;
     this.validator = validator;
@@ -177,6 +178,7 @@ export class ChainNode {
 
   // Every peer request is HTTPS and pinned to the validator fingerprints of the genesis configuration.
   async post(peer, path, body, headers = {}) {
+    if (this.lossRate > 0 && Math.random() < this.lossRate) return false;
     const res = await peerRequest({
       url: peer,
       method: "POST",

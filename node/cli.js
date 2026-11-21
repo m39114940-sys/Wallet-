@@ -59,6 +59,8 @@ const node = new ChainNode({
   genesis,
   validator: { publicKey: validator.publicKey, privateKeyDer: validator.privateKeyDer },
   tlsIdentity: { key: validator.tls.key, cert: validator.tls.cert },
+  // --loss-rate is for tests only: it drops that fraction of outbound peer messages.
+  lossRate: Number(args["loss-rate"] ?? 0),
   selfUrl: args.self ?? `https://${host}:${port}`,
   roundMs: Number(args["round-ms"] ?? 1000),
   log: (msg) => console.error(JSON.stringify({ event: "log", msg })),

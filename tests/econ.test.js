@@ -153,6 +153,7 @@ test("issuance never takes supply past the maximum, even with a huge budget", ()
     initialCirculating: MAX_SUPPLY - SNN(10),
     issuanceBudget: SNN(10), // constructor forbids initial + budget above the ceiling, so the budget is exactly what remains
     securityBudgetPerBlock: SNN(1000),
+    epochBlocks: 1,
   });
   for (let i = 0; i < 20; i++) e.processBlock({});
   assert.ok(e.issued <= MAX_SUPPLY);
@@ -238,6 +239,7 @@ test("only authorised parties can pause, and a pause halts issuance and fee upda
     initialCirculating: SNN(1000),
     issuanceBudget: SNN(100),
     securityBudgetPerBlock: SNN(1),
+    epochBlocks: 1,
     emergencyAuthorizers: ["ops-1"],
   });
   expectCode(() => e.pause({ by: "mallory", reason: "x" }), "UNAUTHORIZED");
@@ -249,7 +251,67 @@ test("only authorised parties can pause, and a pause halts issuance and fee upda
   assert.equal(paused.baseFeeAfter, FEE_CONTROLLER.minFee);
   e.resume({ by: "ops-1", reason: "drill over" });
   const resumed = e.processBlock({ utilBps: 10_000n });
-  assert.equal(resumed.issued, SNN(1));
+  // The deficit from the paused block is not lost: it is carried into the epoch that closes on resume.
+  assert.equal(resumed.issued, SNN(2));
+  assert.equal(e.epochDeficit, 0n);
+});
+
+test("issuance is decided once per epoch, not on every block", () => {
+  const e = new ModelFEconomy({
+    network: "testnet",
+    flags: ALL_ON,
+    initialCirculating: SNN(1000),
+    issuanceBudget: SNN(100),
+    securityBudgetPerBlock: SNN(2),
+    epochBlocks: 5,
+  });
+  for (let i = 1; i <= 4; i++) {
+    const r = e.processBlock({});
+    assert.equal(r.issued, 0n);
+    assert.equal(r.epochClosed, false);
+  }
+  const closing = e.processBlock({});
+  assert.equal(closing.epochClosed, true);
+  assert.equal(closing.issued, SNN(10)); // 5 blocks x 2 SNN deficit = 10 SNN, equal to 1% of 1000 SNN
+  assert.equal(e.blocksInEpoch, 0);
+});
+
+test("the per-epoch cap bounds issuance even when the deficit is huge", () => {
+  const e = new ModelFEconomy({
+    network: "testnet",
+    flags: ALL_ON,
+    initialCirculating: SNN(1000),
+    issuanceBudget: SNN(1_000_000),
+    securityBudgetPerBlock: SNN(1_000_000),
+    epochBlocks: 1,
+  });
+  const r = e.processBlock({});
+  assert.equal(r.issued, SNN(10));
+});
+
+test("a rejected block changes no state at all", () => {
+  const e = new ModelFEconomy({ network: "testnet", flags: ALL_ON, initialCirculating: SNN(1000), epochBlocks: 1 });
+  const before = JSON.stringify(e.snapshot());
+  expectCode(
+    () => e.processBlock({
+      txFees: [SNN(1)],
+      validators: [{ id: "a", weight: 1n, signed: true }, { id: "a", weight: 1n, signed: true }],
+    }),
+    "DUPLICATE_PARTICIPANT",
+  );
+  assert.equal(JSON.stringify(e.snapshot()), before);
+});
+
+test("fees above circulating supply are rejected without touching state", () => {
+  const e = new ModelFEconomy({ network: "testnet", flags: ALL_ON, initialCirculating: SNN(1000), epochBlocks: 1 });
+  const before = JSON.stringify(e.snapshot());
+  expectCode(() => e.processBlock({ txFees: [SNN(2000)] }), "FEES_EXCEED_CIRCULATING");
+  assert.equal(JSON.stringify(e.snapshot()), before);
+});
+
+test("epochBlocks must be a positive integer", () => {
+  expectCode(() => new ModelFEconomy({ network: "testnet", epochBlocks: 0 }), "BAD_EPOCH");
+  expectCode(() => new ModelFEconomy({ network: "testnet", epochBlocks: 1.5 }), "BAD_EPOCH");
 });
 
 test("pause is refused when emergencyControls is off, and the control cannot move supply", () => {
@@ -271,6 +333,7 @@ test("a long randomised run keeps the supply invariant on every block", () => {
     initialCirculating: SNN(1_000_000),
     issuanceBudget: SNN(5_000_000),
     securityBudgetPerBlock: SNN(3),
+    epochBlocks: 10,
     emergencyAuthorizers: ["ops-1"],
   });
   const validators = [1n, 2n, 3n, 4n, 5n].map((w, i) => ({ id: `v${i}`, weight: w, signed: false }));

@@ -7,13 +7,13 @@ export function issuanceAmount({
   remainingBudget,
   circulating,
   remainingSupply,
-  capBps = ISSUANCE.maxPerBlockBps,
+  capBps = ISSUANCE.maxPerEpochBps,
 }) {
   assertUnits(deficit, "deficit");
   assertUnits(remainingBudget, "remainingBudget");
   assertUnits(circulating, "circulating");
   assertUnits(remainingSupply, "remainingSupply");
   assertBps(capBps, "capBps");
-  const perBlockCap = (circulating * capBps) / BPS;
-  return minOf([deficit, remainingBudget, perBlockCap, remainingSupply]);
+  const perEpochCap = (circulating * capBps) / BPS;
+  return minOf([deficit, remainingBudget, perEpochCap, remainingSupply]);
 }

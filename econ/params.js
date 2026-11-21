@@ -20,8 +20,10 @@ export const FEE_CONTROLLER = Object.freeze({
   maxFee: 1_000_000n,  // 1 SNN
 });
 
-// Adaptive issuance per processBlock call is capped at 1% of circulating supply.
-export const ISSUANCE = Object.freeze({ maxPerBlockBps: 100n });
+// Adaptive issuance is decided once per epoch and capped at 1% of circulating supply per epoch.
+// Placeholder epoch length (about one year of 10-minute blocks); to be confirmed by the owner.
+export const DEFAULT_EPOCH_BLOCKS = 52_560;
+export const ISSUANCE = Object.freeze({ maxPerEpochBps: 100n });
 
 // Experimental PoW/PoS split of issued rewards. Not an approved ratio; attack-cost assessment is pending.
 export const DEFAULT_POW_SHARE_BPS = 5_000n;

@@ -21,7 +21,7 @@ Status: modules implemented and unit-tested in isolation. **Not wired into chain
 | `econ/flags.js` | Feature flags, dependency rules, Mainnet refusal. |
 | `econ/fees.js` | Fee split. Validators get 85%, treasury 10%, and the exact remainder is burned (or routed to operations when `burn` is off). |
 | `econ/feecontroller.js` | Dynamic base fee: at most +50% up and -12.5% down per block, clamped to [0.001, 1] SNN. |
-| `econ/issuance.js` | Issuance = min(deficit, remaining budget, 1% of circulating per block, remaining supply). |
+| `econ/issuance.js` | Issuance = min(epoch deficit, remaining budget, 1% of circulating per epoch, remaining supply). Decided once per epoch, not per block. |
 | `econ/ratio.js` | PoW/PoS split of issued rewards. |
 | `econ/rewards.js` | Proportional payouts. Validator payouts require signed weight of at least two-thirds of total weight. Remainders stay in the pool. |
 | `econ/ledgers.js` | Separate `security`, `development`, `operations`, `emergency` ledgers. No transfer method. Spending needs an approval naming the ledger, the exact amount and an approver. |
@@ -40,7 +40,8 @@ and `issued <= 100,000,000 SNN`, with no negative pool. Each movement is a named
 
 ## Test results
 
-- `tests/econ.test.js`: 23 tests, all passing. They cover flag defaults and dependencies, Mainnet refusal, the inert default, exact fee splits, fee-controller bounds under sustained spam and under an empty chain, ledger approval and insolvency, the issuance minimum, the supply ceiling, the two-thirds quorum boundary, proportional payouts with exact remainders, duplicate and zero-weight refusal, emergency authorization, and a 500-block randomised run with pause and resume that checks the invariant on every block.
+- Review fixes in this round: issuance moved from per-block to per-epoch (the earlier per-block cap could exceed 1% per year on a live chain); all input validation now runs before any state change, so a rejected block leaves state untouched (tested); the deficit accumulates across the epoch and is not lost during a pause.
+- `tests/econ.test.js`: 28 tests, all passing. They cover flag defaults and dependencies, Mainnet refusal, the inert default, exact fee splits, fee-controller bounds under sustained spam and under an empty chain, ledger approval and insolvency, the issuance minimum, the supply ceiling, the two-thirds quorum boundary, proportional payouts with exact remainders, duplicate and zero-weight refusal, emergency authorization, and a 500-block randomised run with pause and resume that checks the invariant on every block.
 - Full `npm test`: 204 passing, 0 failing, 1 skipped. The skip is the existing VRF RFC 9381 vector, documented in `SECURITY_ARCHITECTURE.md`.
 
 ## Parameter assumptions to confirm
@@ -49,7 +50,7 @@ These values are proposals carried over from the Model D analysis. They have not
 
 - Fee split 85% validators / 10% treasury / remainder burned.
 - Fee controller steps +50% / -12.5%, bounds 0.001 to 1 SNN.
-- Issuance capped at 1% of circulating per block.
+- Issuance decided once per epoch, capped at 1% of circulating per epoch. Epoch length is a placeholder of 52,560 blocks (about one year of 10-minute blocks); the owner must confirm it.
 - PoW/PoS split 50/50, marked experimental. **No final ratio can be chosen until the attack-cost assessment is complete.**
 
 ## Not done (required before any activation decision)

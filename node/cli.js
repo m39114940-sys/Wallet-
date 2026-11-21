@@ -5,6 +5,7 @@
 //
 // Every node is a validator for now. Relay nodes need their own pinned identity, which is not built yet.
 
+import { loadTrustList } from "./trustlist.js";
 import { readFileSync } from "node:fs";
 import { ChainNode, createHttpServer } from "./node.js";
 import { fingerprintOfPem } from "./tls.js";
@@ -64,6 +65,8 @@ const node = new ChainNode({
   nodeIdentity: args.identity ? loadNodeIdentity(args.identity, process.env.SNN_IDENTITY_PASSPHRASE) : null,
   // --loss-rate is for tests only: it drops that fraction of outbound peer messages.
   lossRate: Number(args["loss-rate"] ?? 0),
+  // Optional operator trust list (JSON) for non-validator peers; see docs/peer-discovery.md.
+  trustedNodes: args.trust ? loadTrustList(args.trust) : new Map(),
   selfUrl: args.self ?? `https://${host}:${port}`,
   roundMs: Number(args["round-ms"] ?? 1000),
   log: (msg) => console.error(JSON.stringify({ event: "log", msg })),

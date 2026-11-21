@@ -8,8 +8,9 @@ export async function makeAccount() {
 }
 
 // Builds a transfer exactly as the app submits it: signed over the integer micro-SNN amount.
-export async function signedTransfer(sender, to, amount, nonce) {
+export async function signedTransfer(sender, to, amount, nonce, chainId) {
   const units = parseAmount(amount).toString();
-  const signature = await signTransfer(sender.signingKey, { from: sender.address, to, units, nonce });
-  return { from: sender.address, to, amount, nonce, publicKey: toHex(sender.publicKey), signature };
+  const bound = chainId === undefined ? {} : { chainId };
+  const signature = await signTransfer(sender.signingKey, { from: sender.address, to, units, nonce, ...bound });
+  return { from: sender.address, to, amount, nonce, publicKey: toHex(sender.publicKey), signature, ...bound };
 }

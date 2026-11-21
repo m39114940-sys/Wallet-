@@ -14,9 +14,11 @@ import http from "node:http";
 import https from "node:https";
 import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
 import { Handshake } from "./handshake.js";
-import { RULES_HYBRID, withWork } from "../chain/core.js";
+import { RULES_HYBRID, withWork, requireChainBinding } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
+import { PeerBook } from "./peerbook.js";
+import { introduce } from "./handshake.js";
 import { peerFingerprintOf } from "./tls.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
@@ -42,6 +44,9 @@ const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
 const MAX_MEMPOOL = 5000;
 const TICK_MS = 50;
+const DIAL_INTERVAL_MS = 10_000; // how often trusted peers with an address are dialed again if they are not active
+const DIALS_PER_ROUND = 4; // candidates tried per round, so a flood of candidates cannot stall the node
+const MAX_PEER_LIST = 50; // addresses served by /peers and accepted from one reply
 const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
 const RATE_PER_SEC = 200; // requests per second refilled per remote address
 const RATE_BURST = 400;
@@ -52,7 +57,7 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, trustedNodes = new Map(), selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
     this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
     this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
@@ -76,6 +81,28 @@ export class ChainNode {
     this.syncedAt = new Map(); // peer url -> time of the last automatic sync
     // Trust anchors: the TLS fingerprints of the genesis validators. A peer must present one of these.
     this.pins = new Set(genesis.validators.map((v) => v.tlsFingerprint).filter((f) => f !== null));
+    // Operator trust list (non-validators): their TLS fingerprints are pinned too, and admission needs their identity.
+    this.trustedNodes = trustedNodes; // Map nodeId -> { publicKey, tlsFingerprint }
+    for (const entry of trustedNodes.values()) this.pins.add(entry.tlsFingerprint);
+    this.peerBook = new PeerBook({
+      trusted: new Map([...trustedNodes].map(([id, entry]) => [id, entry.publicKey])),
+      selfUrl,
+    });
+  }
+
+  // Dials a peer that is in the trust list. Admission happens only after the challenge-response succeeds.
+  async connectPeer(url) {
+    if (!this.nodeIdentity) throw new Error("connectPeer needs a node identity");
+    const { peerId } = await introduce({
+      url,
+      identity: this.nodeIdentity,
+      chainId: this.genesis.chainId,
+      pins: this.pins,
+      tlsIdentity: this.tlsIdentity,
+    });
+    this.peerBook.admit(url, peerId); // throws UNTRUSTED_NODE for identities outside the trust list
+    this.peers.add(this.peerBook.normalize(url));
+    return peerId;
   }
 
   // Automatic syncs (triggered by a message from the future) are rate limited per peer.
@@ -94,7 +121,35 @@ export class ChainNode {
     return result;
   }
 
+  // One maintenance round. Failures are normal and ignored.
+  //  1. Trusted peers with an address that are not active yet.
+  //  2. A few learned candidates. Each one is admitted only if its identity is trusted.
+  //  3. Gossip: ask each active peer for its list. The answer only adds candidates.
+  async maintainPeers() {
+    if (this.dialing) return;
+    this.dialing = true;
+    try {
+      for (const entry of this.trustedNodes.values()) {
+        if (!entry.url || this.peerBook.isActive(entry.url)) continue;
+        await this.connectPeer(entry.url).catch(() => null);
+      }
+      for (const url of this.peerBook.candidateUrls().slice(0, DIALS_PER_ROUND)) {
+        if (this.peerBook.isActive(url)) continue;
+        await this.connectPeer(url).catch(() => this.peerBook.reject(url));
+      }
+      for (const url of this.peerBook.activeUrls()) {
+        const res = await peerRequest({
+          url, path: "/peers", pins: this.pins, identity: this.tlsIdentity, timeoutMs: PEER_TIMEOUT_MS,
+        }).catch(() => null);
+        if (res?.status === 200 && Array.isArray(res.body?.peers)) this.peerBook.learn(res.body.peers.slice(0, MAX_PEER_LIST));
+      }
+    } finally {
+      this.dialing = false;
+    }
+  }
+
   start() {
+    this.dialTimer = setInterval(() => this.maintainPeers(), DIAL_INTERVAL_MS);
     this.timer = setInterval(() => {
       this.run(() => this.consensus.tick()).catch((err) => {
         // The same error would repeat every tick, so log it only when it changes.
@@ -105,6 +160,7 @@ export class ChainNode {
   }
 
   stop() {
+    if (this.dialTimer) clearInterval(this.dialTimer);
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }
@@ -226,6 +282,7 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
+    requireChainBinding(tx, this.genesis);
     await trial.ledger.transfer(tx); // throws LedgerError with a specific code if invalid
 
     this.mempool.set(id, tx);
@@ -243,6 +300,7 @@ export class ChainNode {
     const included = [];
     for (const tx of this.mempool.values()) {
       try {
+        requireChainBinding(tx, this.genesis);
         await trial.ledger.transfer(tx);
         included.push(tx);
       } catch {
@@ -326,6 +384,7 @@ export class ChainNode {
     const trial = await cloneState(this.state);
     for (const [id, tx] of [...this.mempool]) {
       try {
+        requireChainBinding(tx, this.genesis);
         await trial.ledger.transfer(tx);
       } catch {
         this.mempool.delete(id);
@@ -494,6 +553,11 @@ export function createHttpServer(node, tlsOptions = null) {
         return sendJson(res, 200, { authenticated: peer.nodeId });
       }
       if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
+      // Only admitted peers are listed; candidates that were never verified are not passed on.
+      if (req.method === "GET" && pathname === "/peers") {
+        const peers = [...(node.selfUrl ? [node.selfUrl] : []), ...(node.peerBook?.activeUrls() ?? [])];
+        return sendJson(res, 200, { peers: peers.slice(0, MAX_PEER_LIST) });
+      }
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);
         const limit = Number(url.searchParams.get("limit") ?? MAX_PAGE);

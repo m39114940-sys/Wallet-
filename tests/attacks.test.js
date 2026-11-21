@@ -131,10 +131,10 @@ test("cross-chain certificates: a certificate for chain A is rejected on chain B
   await assert.rejects(applyCommitted(s.state0, certifiedOnA, s.parent, s.config), { code: "BAD_CERTIFICATE" });
 });
 
-// KNOWN GAP, pinned as current behaviour. The transfer signature does not cover a chain id, so the
-// same signed transfer is accepted on another chain with the same accounts. This test passes today and
-// must be changed when the gap is closed. Closing it changes the signed message, which the wallet app
-// also signs, so it needs a compatibility decision (see SECURITY_ARCHITECTURE.md).
+// KNOWN GAP, pinned as current behaviour on Testnet. A LEGACY (v1) transfer does not cover a chain id, so the
+// same signed transfer is accepted on another chain with the same accounts. Testnet rules are kept unchanged,
+// so this stays open there. Chain-bound (v2) transfers close it: see tests/chainbinding.test.js, and
+// hybrid-v1 chains refuse legacy transfers outright.
 test("KNOWN GAP: a transfer signed for chain A is currently accepted on chain B with the same accounts", async () => {
   const a = await setup("snn-chain-a");
   const b = await setup("snn-chain-b", a);

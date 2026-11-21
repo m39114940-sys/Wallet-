@@ -5,6 +5,9 @@ const subtle = globalThis.crypto.subtle;
 const encoder = new TextEncoder();
 const ADDRESS_DOMAIN = "SNN-ADDR-v2";
 const TX_DOMAIN = "SNN-TX-v1";
+// v2 covers the chain id, so a transfer signed for one chain cannot be replayed on another (KNOWN GAP 19).
+const TX_DOMAIN_V2 = "SNN-TX-v2";
+const CHAIN_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
 
 export const PUBLIC_KEY_BYTES = 32;
 export const PKCS8_PRIVATE_KEY_BYTES = 48; // Ed25519 PKCS#8 DER for a 32-byte seed
@@ -65,8 +68,16 @@ export async function keyMatchesPublicKey(signingKey, publicKey) {
 }
 
 // Every field the signature covers. Amounts are integer micro-SNN strings, never decimals.
-export function transferMessage({ from, to, units, nonce }) {
-  return encoder.encode([TX_DOMAIN, from, to, String(units), String(nonce)].join("|"));
+// Without chainId this is the legacy v1 message (still accepted on chains that have not required v2).
+// With chainId it is the v2 message, which binds the transfer to that chain.
+export function transferMessage({ from, to, units, nonce, chainId }) {
+  if (chainId === undefined) {
+    return encoder.encode([TX_DOMAIN, from, to, String(units), String(nonce)].join("|"));
+  }
+  if (typeof chainId !== "string" || !CHAIN_ID_PATTERN.test(chainId)) {
+    throw new Error("معرّف السلسلة غير صالح.");
+  }
+  return encoder.encode([TX_DOMAIN_V2, chainId, from, to, String(units), String(nonce)].join("|"));
 }
 
 export async function signTransfer(signingKey, fields) {
@@ -74,7 +85,7 @@ export async function signTransfer(signingKey, fields) {
 }
 
 // Checks that the public key belongs to the claimed sender, then that the signature matches the exact fields.
-export async function verifyTransferSignature({ from, to, units, nonce, publicKey, signature }) {
+export async function verifyTransferSignature({ from, to, units, nonce, publicKey, signature, chainId }) {
   let pub;
   let sig;
   try {
@@ -86,11 +97,14 @@ export async function verifyTransferSignature({ from, to, units, nonce, publicKe
   if (pub.length !== PUBLIC_KEY_BYTES || sig.length !== SIGNATURE_BYTES) {
     return { ok: false, code: "BAD_SIGNATURE", message: "طول التوقيع أو المفتاح العام غير صحيح." };
   }
+  if (chainId !== undefined && (typeof chainId !== "string" || !CHAIN_ID_PATTERN.test(chainId))) {
+    return { ok: false, code: "BAD_CHAIN_ID", message: "معرّف السلسلة في المعاملة غير صالح." };
+  }
   if ((await addressFromPublicKey(pub)) !== from) {
     return { ok: false, code: "UNAUTHORIZED", message: "المفتاح العام لا يطابق عنوان المرسل." };
   }
   const key = await subtle.importKey("raw", pub, { name: "Ed25519" }, false, ["verify"]);
-  const valid = await subtle.verify("Ed25519", key, sig, transferMessage({ from, to, units, nonce }));
+  const valid = await subtle.verify("Ed25519", key, sig, transferMessage({ from, to, units, nonce, chainId }));
   return valid
     ? { ok: true }
     : { ok: false, code: "BAD_SIGNATURE", message: "التوقيع لا يطابق بيانات التحويل." };

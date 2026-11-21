@@ -14,6 +14,7 @@ import { initNetwork } from "../node/tools.js";
 import { buildBlock, voteMessage } from "../chain/core.js";
 import { signText } from "../chain/crypto.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
+import { peerRequest, createTlsIdentity } from "../node/tls.js";
 
 const CLI = fileURLToPath(new URL("../node/cli.js", import.meta.url));
 const CHAIN = "snn-testnet-itest";
@@ -23,6 +24,9 @@ let dir;
 let alice;
 let bob;
 let validators;
+let pins;
+const KEY_PASSPHRASE = "network-test-passphrase";
+let clientId; // validator 0's identity, presented as the client certificate
 let nodes;
 
 function freePort() {
@@ -47,24 +51,23 @@ function startNode(name, port, validatorIndex, peerUrls) {
     "--round-ms", String(ROUND_MS),
   ];
   for (const p of peerUrls) args.push("--peer", p);
-  const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, SNN_VALIDATOR_PASSPHRASE: KEY_PASSPHRASE },
+  });
   child.stderr.on("data", (d) => process.env.SNN_TEST_DEBUG && process.stderr.write(d));
   procs.set(name, child);
-  return { name, url: `http://127.0.0.1:${port}` };
+  return { name, url: `https://127.0.0.1:${port}` };
 }
 
 async function get(node, path) {
-  const res = await fetch(`${node.url}${path}`);
-  return { status: res.status, body: await res.json() };
+  const res = await peerRequest({ url: node.url, path, pins, identity: clientId });
+  return { status: res.status, body: res.body };
 }
 
-async function post(node, path, body) {
-  const res = await fetch(`${node.url}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return { status: res.status, body: await res.json() };
+async function post(node, path, body, headers = {}) {
+  const res = await peerRequest({ url: node.url, method: "POST", path, body, headers, pins, identity: clientId });
+  return { status: res.status, body: res.body };
 }
 
 async function waitFor(predicate, label, timeoutMs = 30_000) {
@@ -106,7 +109,10 @@ before(async () => {
   dir = mkdtempSync(join(tmpdir(), "snn-net-"));
   alice = await makeAccount();
   bob = await makeAccount();
-  ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address]));
+  // Validator keys are encrypted, so every node must open its file with the passphrase.
+  ({ validators } = await initNetwork(dir, CHAIN, [alice.address, bob.address], { passphrase: KEY_PASSPHRASE }));
+  pins = new Set(validators.map((v) => v.tls.fingerprint));
+  clientId = { key: validators[0].tls.key, cert: validators[0].tls.cert };
 });
 
 after(() => {
@@ -116,7 +122,7 @@ after(() => {
 
 test("four validators agree on certified blocks, survive a crash, and punish double signing", async () => {
   const ports = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
-  const urls = ports.map((p) => `http://127.0.0.1:${p}`);
+  const urls = ports.map((p) => `https://127.0.0.1:${p}`);
   // Full mesh: every validator knows every other one from the start.
   nodes = ports.map((port, i) =>
     startNode(`v${i + 1}`, port, i + 1, urls.filter((_, j) => j !== i)),
@@ -142,7 +148,7 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
 
   const tip = (await get(v1, "/status")).body;
   const honest = await certifiedBlock(
-    buildBlock({ height: tip.height + 1, timestamp: Math.floor(Date.now() / 1000), prevHash: tip.tipHash, txs: [] }),
+    buildBlock({ height: tip.height + 1, timestamp: Date.now(), prevHash: tip.tipHash, txs: [] }),
     0,
     [1, 2, 3],
   );
@@ -201,9 +207,25 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   assert.equal(await balanceUnits(v2, alice.address), "96000000");
   assert.equal((await get(v1, "/status")).body.tipHash, (await get(v2, "/status")).body.tipHash);
 
-  // 7. A flood from one address is throttled, and the node recovers once the bucket refills.
+  // 7. Peers cannot be added from the network. A forged header adds nothing, /peers is gone,
+  //    and /sync refuses any address that the operator did not configure.
+  await peerRequest({ url: v1.url, path: "/status", headers: { "x-peer-url": "https://127.0.0.1:1" }, pins, identity: clientId });
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins: new Set(["0".repeat(64)]) }), { code: "TLS_PIN_MISMATCH" });
+  assert.ok(!(await get(v1, "/status")).body.peers.includes("https://127.0.0.1:1"));
+
+  // Mutual TLS: a client certificate that is not a validator pin is dropped by the server, and so is
+  // a client that presents no certificate at all. Both fail before any request is processed.
+  const outsider = createTlsIdentity("outsider-node");
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins, identity: outsider }));
+  await assert.rejects(peerRequest({ url: v1.url, path: "/status", pins }));
+  assert.equal((await post(v1, "/peers", { url: "https://127.0.0.1:1" })).status, 404);
+  const foreignSync = await post(v1, "/sync", { url: "https://127.0.0.1:1" });
+  assert.equal(foreignSync.status, 400);
+  assert.equal(foreignSync.body.code, "PEER_NOT_ALLOWED");
+
+  // 8. A flood from one address is throttled, and the node recovers once the bucket refills.
   const flood = await Promise.all(
-    Array.from({ length: 600 }, () => fetch(`${v1.url}/status`).then((r) => r.status)),
+    Array.from({ length: 600 }, () => get(v1, "/status").then((r) => r.status)),
   );
   assert.ok(flood.includes(429), "a burst above the limit is refused");
   await waitFor(async () => (await get(v1, "/status")).status === 200, "rate limit recovers", 10_000);

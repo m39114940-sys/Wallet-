@@ -49,7 +49,7 @@ test("a block needs a certificate above two thirds of validator weight", async (
   const { alice, bob, keys, config } = await setup();
   const genesis = genesisBlock(config);
   const state0 = genesisState(config);
-  const parent = { height: 0, hash: genesis.hash };
+  const parent = { height: 0, hash: genesis.hash, timestamp: T0 };
   const pay = await signedTransfer(alice, bob.address, "3", 0);
   const block = buildBlock({ height: 1, timestamp: T0 + 10, prevHash: genesis.hash, txs: [pay] });
 
@@ -64,7 +64,7 @@ test("signatures that do not count: repeats, outsiders, and a certificate for an
   const { alice, bob, keys, config } = await setup();
   const genesis = genesisBlock(config);
   const state0 = genesisState(config);
-  const parent = { height: 0, hash: genesis.hash };
+  const parent = { height: 0, hash: genesis.hash, timestamp: T0 };
   const pay = await signedTransfer(alice, bob.address, "3", 0);
   const block = buildBlock({ height: 1, timestamp: T0 + 10, prevHash: genesis.hash, txs: [pay] });
   const good = await certify(block, keys, 0, [0, 1, 2]);
@@ -94,7 +94,7 @@ test("a transaction changed after certification is refused by the Merkle check",
   const block = buildBlock({ height: 1, timestamp: T0 + 10, prevHash: genesis.hash, txs: [pay] });
   const good = await certify(block, keys, 0, [0, 1, 2]);
   const tampered = { ...good, txs: [{ ...good.txs[0], amount: "500" }] };
-  await assert.rejects(applyCommitted(genesisState(config), tampered, { height: 0, hash: genesis.hash }, config), {
+  await assert.rejects(applyCommitted(genesisState(config), tampered, { height: 0, hash: genesis.hash, timestamp: T0 }, config), {
     code: "BAD_MERKLE",
   });
 });
@@ -105,7 +105,7 @@ test("two precommits for different blocks prove double signing: the validator is
   const b1 = buildBlock({ height: 1, timestamp: T0 + 10, prevHash: genesis.hash, txs: [] });
   const state1 = await applyCommitted(genesisState(config), await certify(b1, keys, 0, [0, 1, 2]), {
     height: 0,
-    hash: genesis.hash,
+    hash: genesis.hash, timestamp: T0,
   }, config);
 
   const blockA = "a".repeat(64);
@@ -124,7 +124,7 @@ test("two precommits for different blocks prove double signing: the validator is
   };
 
   const b2 = buildBlock({ height: 2, timestamp: T0 + 20, prevHash: b1.hash, txs: [], evidence: [evidence] });
-  const state2 = await applyCommitted(state1, await certify(b2, keys, 0, [0, 1, 2]), { height: 1, hash: b1.hash }, config);
+  const state2 = await applyCommitted(state1, await certify(b2, keys, 0, [0, 1, 2]), { height: 1, hash: b1.hash, timestamp: T0 + 10 }, config);
   assert.equal(state2.stakes.get(culprit.publicKey), 950000000n); // 5% burned from 1000 SNN
   assert.ok(state2.jailed.has(culprit.publicKey));
   assert.equal(validatorWeights(state2, MAX_SHARE).weights.size, 3);
@@ -133,7 +133,7 @@ test("two precommits for different blocks prove double signing: the validator is
   // A jailed validator's signature no longer counts toward a certificate.
   const b3 = buildBlock({ height: 3, timestamp: T0 + 30, prevHash: b2.hash, txs: [] });
   const withJailed = await certify(b3, keys, 0, [0, 1, 3]);
-  await assert.rejects(applyCommitted(state2, withJailed, { height: 2, hash: b2.hash }, config), {
+  await assert.rejects(applyCommitted(state2, withJailed, { height: 2, hash: b2.hash, timestamp: T0 + 20 }, config), {
     code: "BAD_CERTIFICATE",
   });
 });
@@ -156,7 +156,7 @@ test("evidence is refused when its signatures do not match or when both votes na
     txs: [],
     evidence: [{ ...base, signatureB: sigA }],
   });
-  await assert.rejects(applyBlock(state0, swapped, { height: 0, hash: genesis.hash }, config), { code: "BAD_EVIDENCE" });
+  await assert.rejects(applyBlock(state0, swapped, { height: 0, hash: genesis.hash, timestamp: T0 }, config), { code: "BAD_EVIDENCE" });
 
   const same = buildBlock({
     height: 1,
@@ -165,7 +165,7 @@ test("evidence is refused when its signatures do not match or when both votes na
     txs: [],
     evidence: [{ ...base, blockB: blockA, signatureB: sigA }],
   });
-  await assert.rejects(applyBlock(state0, same, { height: 0, hash: genesis.hash }, config), { code: "BAD_EVIDENCE" });
+  await assert.rejects(applyBlock(state0, same, { height: 0, hash: genesis.hash, timestamp: T0 }, config), { code: "BAD_EVIDENCE" });
 });
 
 test("with two of four validators jailed, the weight rules cannot run and the chain halts", async () => {
@@ -188,4 +188,12 @@ test("replaying stored blocks rebuilds the state, and a tampered stored block is
   const tampered = JSON.parse(JSON.stringify(b1));
   tampered.txs[0].amount = "500";
   await assert.rejects(replayChain([genesis, tampered], config), { code: "BAD_MERKLE" });
+});
+
+test("a block must be stamped later than its parent", async () => {
+  const { keys, config } = await setup();
+  const genesis = genesisBlock(config);
+  const block = buildBlock({ height: 1, timestamp: T0, prevHash: genesis.hash, txs: [] });
+  const cert = await certify(block, keys, 0, [0, 1, 2]);
+  await assert.rejects(applyCommitted(genesisState(config), cert, genesis, config), { code: "BAD_TIMESTAMP" });
 });

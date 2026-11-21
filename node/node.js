@@ -11,6 +11,15 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import http from "node:http";
+import https from "node:https";
+import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
+import { Handshake } from "./handshake.js";
+import { RULES_HYBRID, withWork } from "../chain/core.js";
+import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
+import { PeerGuard } from "./guard.js";
+import { peerFingerprintOf } from "./tls.js";
+
+const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
@@ -25,6 +34,7 @@ import {
   replayChain,
   txId,
   verifyEvidence,
+  MAX_CLOCK_DRIFT_MS,
 } from "../chain/core.js";
 import { Consensus } from "../chain/consensus.js";
 
@@ -35,18 +45,26 @@ const TICK_MS = 50;
 const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
 const RATE_PER_SEC = 200; // requests per second refilled per remote address
 const RATE_BURST = 400;
+const MAX_PAGE = 200; // blocks per request, both when serving and when syncing
+const MAX_SYNC_BLOCKS = 100_000;
 
 const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, selfUrl = null, roundMs = 1000, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+    this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
+    this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
+    this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
+    this.authenticatedPeers = new Map(); // nodeId -> { publicKey, at }: peers that proved their key
+    this.lossRate = lossRate; // TESTING ONLY: fraction of outbound peer requests dropped at random
     this.dataDir = dataDir;
     this.genesis = genesis;
     this.validator = validator;
     this.selfUrl = selfUrl;
     this.log = log;
     this.peers = new Set();
+    this.allowed = new Set(); // peers named by the operator; nothing learned from the network adds to this
     this.blocks = [];
     this.state = null;
     this.mempool = new Map();
@@ -56,10 +74,13 @@ export class ChainNode {
     this.timer = null;
     this.lastError = null;
     this.syncedAt = new Map(); // peer url -> time of the last automatic sync
+    // Trust anchors: the TLS fingerprints of the genesis validators. A peer must present one of these.
+    this.pins = new Set(genesis.validators.map((v) => v.tlsFingerprint).filter((f) => f !== null));
   }
 
   // Automatic syncs (triggered by a message from the future) are rate limited per peer.
   async syncIfDue(url) {
+    if (!this.isAllowedPeer(url)) return { adopted: false, skipped: true };
     const last = this.syncedAt.get(url) ?? 0;
     if (Date.now() - last < SYNC_COOLDOWN_MS) return { adopted: false, skipped: true };
     this.syncedAt.set(url, Date.now());
@@ -140,8 +161,8 @@ export class ChainNode {
     };
   }
 
-  blocksFrom(height) {
-    return this.blocks.filter((b) => b.height >= height);
+  blocksFrom(height, limit = MAX_PAGE) {
+    return this.blocks.slice(height, height + Math.min(limit, MAX_PAGE));
   }
 
   balance(address) {
@@ -154,19 +175,31 @@ export class ChainNode {
 
   // ---------- Peers and gossip ----------
 
+  // Peers come only from the operator's configuration (--peer). Nothing received over the network adds one.
   addPeer(url) {
     if (url === this.selfUrl) return;
+    this.allowed.add(url);
     this.peers.add(url);
   }
 
+  isAllowedPeer(url) {
+    return this.allowed.has(url);
+  }
+
+  // Every peer request is HTTPS and pinned to the validator fingerprints of the genesis configuration.
   async post(peer, path, body, headers = {}) {
-    const res = await fetch(`${peer}${path}`, {
+    if (this.lossRate > 0 && Math.random() < this.lossRate) return false;
+    const res = await peerRequest({
+      url: peer,
       method: "POST",
-      headers: { "content-type": "application/json", "x-peer-url": this.selfUrl ?? "", ...headers },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(PEER_TIMEOUT_MS),
+      path,
+      body,
+      headers: { "x-peer-url": this.selfUrl ?? "", ...headers },
+      pins: this.pins,
+      identity: this.tlsIdentity,
+      timeoutMs: PEER_TIMEOUT_MS,
     });
-    return res.ok;
+    return res.status === 200;
   }
 
   // Failures are ignored on purpose: a dead peer must never stop the local node.
@@ -216,13 +249,15 @@ export class ChainNode {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
       }
     }
-    return buildBlock({
+    const block = buildBlock({
       height: this.tip.height + 1,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Math.max(Date.now(), this.tip.timestamp + 1), // milliseconds, strictly increasing
       prevHash: this.tip.hash,
       txs: included,
       evidence,
     });
+    // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
+    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis, this.tip, this.blocks) : block;
   }
 
   // ---------- Evidence ----------
@@ -314,7 +349,10 @@ export class ChainNode {
       if (fromUrl) await this.syncIfDue(fromUrl).catch(() => null);
       return { accepted: false, reason: "behind, synced" };
     }
-    const state = await applyCommitted(this.state, block, this.tip, this.genesis);
+    if (!(block.timestamp <= Date.now() + MAX_CLOCK_DRIFT_MS)) {
+      throw new ChainError("BAD_TIMESTAMP", "الكتلة مختومة بوقت أبعد من الساعة المسموحة.");
+    }
+    const state = await applyCommitted(this.state, block, this.tip, this.genesis, this.blocks);
     await this.commitBlock(block, state);
     this.gossip("/block", block, fromUrl);
     return { accepted: true, height: block.height };
@@ -322,13 +360,36 @@ export class ChainNode {
 
   // Downloads a peer's full chain and adopts it only if it replays from genesis and is longer than ours.
   async sync(url) {
-    const res = await fetch(`${url}/blocks?from=0`, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
-    const blocks = await res.json();
-    if (!Array.isArray(blocks) || blocks.length <= this.blocks.length) {
+    if (!this.isAllowedPeer(url)) throw new ChainError("PEER_NOT_ALLOWED", "هذا العنوان ليس نظيراً معتمداً.");
+    const blocks = [];
+    for (let from = 0; ; ) {
+      const res = await peerRequest({
+        url,
+        path: `/blocks?from=${from}&limit=${MAX_PAGE}`,
+        pins: this.pins,
+        identity: this.tlsIdentity,
+        timeoutMs: 10_000,
+      });
+      if (res.status !== 200) throw new ChainError("SYNC_FAILED", `فشل الاتصال بـ ${url}`);
+      const page = res.body;
+      if (!Array.isArray(page) || page.length > MAX_PAGE) throw new ChainError("SYNC_FAILED", "استجابة المزامنة غير صالحة.");
+      blocks.push(...page);
+      if (blocks.length > MAX_SYNC_BLOCKS) throw new ChainError("SYNC_FAILED", "السلسلة المعروضة أكبر من الحد المسموح.");
+      if (page.length < MAX_PAGE) break;
+      from += page.length;
+    }
+    if (!Array.isArray(blocks) || blocks.length === 0) return { adopted: false, height: this.tip.height };
+    // Finality: a chain that rewrites a committed block is refused before any other check.
+    if (!keepsCommittedPrefix(this.blocks, blocks)) {
+      throw new ChainError("REORG_BELOW_COMMITTED", "السلسلة المعروضة تعيد كتابة كتل معتمدة عندنا.");
+    }
+    // Cheap refusal under Testnet rules: a candidate that is not longer cannot win, so it is not replayed.
+    if (this.genesis.rules !== RULES_HYBRID && blocks.length <= this.blocks.length) {
       return { adopted: false, height: this.tip.height };
     }
     const state = await replayChain(blocks, this.genesis);
+    // Preference is decided only after the whole candidate has been validated.
+    if (!decideAdoption(this.blocks, blocks, this.genesis).adopt) return { adopted: false, height: this.tip.height };
     this.blocks = blocks;
     this.state = state;
     for (const [key, ev] of this.evidence) {
@@ -381,6 +442,9 @@ function makeLimiter() {
   const buckets = new Map();
   return (key) => {
     const now = Date.now();
+    if (buckets.size > 10_000) {
+      for (const [k, v] of buckets) if (now - v.at > 60_000) buckets.delete(k);
+    }
     const b = buckets.get(key) ?? { tokens: RATE_BURST, at: now };
     b.tokens = Math.min(RATE_BURST, b.tokens + ((now - b.at) * RATE_PER_SEC) / 1000);
     b.at = now;
@@ -391,24 +455,49 @@ function makeLimiter() {
   };
 }
 
-export function createHttpServer(node) {
+// tlsOptions: { key, cert } PEM. Without it the server is plain HTTP, which only tests should use.
+export function createHttpServer(node, tlsOptions = null) {
   const allow = makeLimiter();
-  return http.createServer(async (req, res) => {
+  const guard = node.guard ?? (node.guard = new PeerGuard());
+  const handler = async (req, res) => {
+    const fingerprint = peerFingerprintOf(req.socket);
+    // A banned pinned peer gets no answer at all.
+    if (fingerprint !== null && guard.isBanned(fingerprint)) {
+      req.socket.destroy();
+      return;
+    }
     try {
       if (!allow(req.socket.remoteAddress ?? "unknown")) {
         return sendJson(res, 429, { error: "rate limited", code: "RATE_LIMITED" });
       }
       const url = new URL(req.url, "http://localhost");
       const { pathname } = url;
-      // Any peer that talks to us is added to our peer list, so a full mesh forms from partial knowledge.
+      // Sent by peers, used only to skip them when re-gossiping. It never adds a peer.
       const fromUrl = req.headers["x-peer-url"] || null;
-      if (fromUrl) node.addPeer(fromUrl);
 
       if (req.method === "GET" && pathname === "/status") return sendJson(res, 200, node.status());
+      if (req.method === "GET" && pathname === "/identity") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        return sendJson(res, 200, { chainId: node.genesis.chainId, nodeId: node.nodeIdentity.nodeId, publicKey: node.nodeIdentity.publicKey });
+      }
+      if (req.method === "GET" && pathname === "/challenge") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        return sendJson(res, 200, node.handshake.challenge());
+      }
+      if (req.method === "POST" && pathname === "/hello") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        const peer = await node.handshake.verify(await readJson(req));
+        if (!node.authenticatedPeers.has(peer.nodeId) && node.authenticatedPeers.size >= MAX_AUTHENTICATED_PEERS) {
+          node.authenticatedPeers.delete(node.authenticatedPeers.keys().next().value);
+        }
+        node.authenticatedPeers.set(peer.nodeId, { publicKey: peer.publicKey, at: Date.now() });
+        return sendJson(res, 200, { authenticated: peer.nodeId });
+      }
       if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);
-        return sendJson(res, 200, node.blocksFrom(Number.isInteger(from) && from >= 0 ? from : 0));
+        const limit = Number(url.searchParams.get("limit") ?? MAX_PAGE);
+        return sendJson(res, 200, node.blocksFrom(Number.isInteger(from) && from >= 0 ? from : 0, limit));
       }
       if (req.method === "GET" && pathname === "/balance") {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
@@ -429,11 +518,6 @@ export function createHttpServer(node) {
         const body = await readJson(req);
         return sendJson(res, 200, await node.run(() => node.receiveEvidence(body, fromUrl)));
       }
-      if (req.method === "POST" && pathname === "/peers") {
-        const body = await readJson(req);
-        node.addPeer(requirePeerUrl(body));
-        return sendJson(res, 200, { peers: [...node.peers] });
-      }
       if (req.method === "POST" && pathname === "/sync") {
         const body = await readJson(req);
         const peer = requirePeerUrl(body);
@@ -442,10 +526,22 @@ export function createHttpServer(node) {
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {
       const known = err instanceof LedgerError || err instanceof ChainError;
+      if (known && fingerprint !== null) guard.recordBad(fingerprint, err.code);
       return sendJson(res, known ? 400 : 500, {
         error: known ? err.message : "internal error",
         code: known ? err.code : "INTERNAL",
       });
     }
+  };
+  if (!tlsOptions) return http.createServer(handler);
+  // Mutual TLS: the server asks for a client certificate, and drops any connection whose
+  // certificate fingerprint is not a validator pin, before any HTTP bytes are parsed.
+  const server = https.createServer(
+    { ...tlsOptions, ...TLS_VERSION_OPTIONS, requestCert: true, rejectUnauthorized: false },
+    handler,
+  );
+  server.prependListener("secureConnection", (socket) => {
+    if (!isPinnedSocket(socket, node.pins)) socket.destroy();
   });
+  return server;
 }

@@ -5,6 +5,7 @@
 // State: { ledger, stakes: Map<publicKey, bigint>, jailed: Set<publicKey> }
 // Stakes and weights are integers (micro-SNN units), so slashing and quorum use exact arithmetic.
 
+import { validateWork, mine, nextTarget, PowError } from "./pow.js";
 import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
 import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
@@ -12,6 +13,7 @@ import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
 export const GENESIS_PREV_HASH = "0".repeat(64);
 export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
 export const NIL = "nil"; // vote for "no block"
+export const MAX_CLOCK_DRIFT_MS = 15_000; // a new block may not be stamped more than this far ahead of our clock
 export const EVIDENCE_TYPES = ["prevote", "precommit"];
 
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -109,17 +111,27 @@ export async function verifyEvidence(evRaw, chainId, state) {
 
 // validators: [{ publicKey (hex), stake (decimal string of micro-SNN units) }]
 // maxShareBps: the largest weight one validator may carry, in basis points.
-export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS }) {
-  return {
+// rules: optional. Absent means the current Testnet rules, and the key is then not written at all, so
+// existing Testnet genesis hashes do not change. 'hybrid-v1' adds the proof-of-work check (see docs/hybrid-consensus.md).
+// powTarget: hex target for 'hybrid-v1' blocks. Fixed for now; difficulty retargeting is not wired in yet.
+export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs }) {
+  const config = {
     chainId,
     timestamp,
     maxShareBps: Number(maxShareBps),
     allocations: [...allocations].sort(),
     validators: validators
-      .map((v) => ({ publicKey: v.publicKey, stake: String(v.stake) }))
+      .map((v) => ({ publicKey: v.publicKey, stake: String(v.stake), tlsFingerprint: v.tlsFingerprint ?? null }))
       .sort((a, b) => (a.publicKey < b.publicKey ? -1 : 1)),
   };
+  if (rules !== undefined) config.rules = rules;
+  if (powTarget !== undefined) config.powTarget = powTarget;
+  if (powRetargetWindow !== undefined) config.powRetargetWindow = powRetargetWindow;
+  if (powBlockTimeMs !== undefined) config.powBlockTimeMs = powBlockTimeMs;
+  return config;
 }
+
+export const RULES_HYBRID = "hybrid-v1";
 
 export function validateGenesis(config) {
   const bad = (msg) => new ChainError("BAD_GENESIS", msg);
@@ -129,11 +141,26 @@ export function validateGenesis(config) {
     throw bad("حد الحصة يجب أن يكون عدداً صحيحاً بين 1 و 10000 نقطة أساس.");
   }
   if (!Array.isArray(config.validators) || config.validators.length === 0) throw bad("لا يوجد مدققون في التأسيس.");
+  if (config.rules !== undefined && config.rules !== RULES_HYBRID) throw bad("قواعد الشبكة غير معروفة.");
+  if (config.rules === RULES_HYBRID) {
+    if (typeof config.powTarget !== "string" || !/^[0-9a-f]{1,64}$/.test(config.powTarget)) throw bad("هدف إثبات العمل غير صالح.");
+    if (BigInt("0x" + config.powTarget) === 0n) throw bad("هدف إثبات العمل يجب ألا يكون صفراً.");
+    const W = config.powRetargetWindow ?? 0;
+    if (!Number.isInteger(W) || W < 0 || W > 10_000) throw bad("نافذة تعديل الصعوبة غير صالحة.");
+    if (W > 0 && (!Number.isSafeInteger(config.powBlockTimeMs) || config.powBlockTimeMs <= 0)) {
+      throw bad("زمن الكتلة المستهدف مطلوب مع تعديل الصعوبة.");
+    }
+  } else if (config.powTarget !== undefined || config.powRetargetWindow !== undefined || config.powBlockTimeMs !== undefined) {
+    throw bad("هدف إثبات العمل يُستخدم فقط مع قواعد hybrid-v1.");
+  }
   const seen = new Set();
   for (const v of config.validators) {
     if (!HEX_64.test(v.publicKey)) throw bad("مفتاح مدقق غير صالح.");
     if (seen.has(v.publicKey)) throw bad("مدقق مكرر في التأسيس.");
     if (!DECIMAL_STAKE.test(v.stake)) throw bad("حصة المدقق يجب أن تكون عدداً صحيحاً موجباً.");
+    if (v.tlsFingerprint !== null && !HEX_64.test(v.tlsFingerprint ?? "")) {
+      throw bad("بصمة شهادة TLS للمدقق غير صالحة.");
+    }
     seen.add(v.publicKey);
   }
 }
@@ -193,6 +220,7 @@ export function validatorWeights(state, maxShareBps) {
 
 // ---------- Blocks ----------
 
+// The work field is hashed only when present, so blocks without it (Testnet) keep their hashes.
 export const blockHashOf = (block) =>
   sha256Hex(
     canonicalJson({
@@ -201,13 +229,14 @@ export const blockHashOf = (block) =>
       prevHash: block.prevHash,
       merkleRoot: block.merkleRoot,
       evidenceRoot: block.evidenceRoot,
+      ...(block.work !== undefined ? { work: block.work } : {}),
     }),
   );
 
 const evidenceRootOf = (evidence) => merkleRoot(evidence.map((e) => sha256Hex(canonicalJson(e))));
 
 // Builds an unsigned block. Evidence is sorted by key, so the block bytes do not depend on arrival order.
-export function buildBlock({ height, timestamp, prevHash, txs, evidence = [] }) {
+export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], work }) {
   const normalized = txs.map(normalizeTx);
   const sorted = evidence.map(normalizeEvidence).sort((a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1));
   const block = {
@@ -220,8 +249,78 @@ export function buildBlock({ height, timestamp, prevHash, txs, evidence = [] }) 
     evidence: sorted,
     certificate: null,
   };
+  if (work !== undefined) block.work = work;
   block.hash = blockHashOf(block);
   return block;
+}
+
+const targetOfBlock = (block, config) => (block.work ? BigInt("0x" + block.work.target) : BigInt("0x" + config.powTarget));
+
+// The target a block at `height` must carry. It depends only on ancestors, never on the miner's choice.
+// Without a retarget window it is the target of the parent. At a window boundary it moves by the ratio of the
+// time the last window took to the time it should have taken (clamped, and never easier than genesis).
+// `chain` is the array of blocks indexed by height; it is needed only at window boundaries.
+export function expectedTarget(config, parent, chain, height) {
+  const prev = targetOfBlock(parent, config);
+  const W = config.powRetargetWindow ?? 0;
+  if (W === 0 || height % W !== 0) return prev;
+  const start = Array.isArray(chain) ? chain[height - W] : undefined;
+  if (!start) throw new ChainError("BAD_HISTORY", "تاريخ السلسلة غير متاح لحساب الصعوبة.");
+  try {
+    return nextTarget({
+      previousTarget: prev,
+      actualSeconds: BigInt(parent.timestamp - start.timestamp),
+      expectedSeconds: BigInt(W) * BigInt(config.powBlockTimeMs),
+      minTarget: 1n,
+      maxTarget: BigInt("0x" + config.powTarget),
+    });
+  } catch (err) {
+    if (err instanceof PowError) throw new ChainError(err.code, err.message);
+    throw err;
+  }
+}
+
+// Checks the proof of work of a 'hybrid-v1' block against the target its ancestors require. The header
+// commits to the chain id, so work from another chain fails. A block that states another target fails too.
+export function checkBlockWork(block, config, parent, chain = null) {
+  const w = block.work;
+  if (w === null || typeof w !== "object" || Object.keys(w).sort().join() !== "nonce,target") {
+    throw new ChainError("POW_MISSING", "الكتلة بلا إثبات عمل صالح.");
+  }
+  if (typeof w.target !== "string" || !/^[0-9a-f]{1,64}$/.test(w.target)) {
+    throw new ChainError("POW_BAD_TARGET", "الهدف في الترويسة غير صالح.");
+  }
+  const expected = expectedTarget(config, parent, chain, block.height);
+  try {
+    validateWork(
+      {
+        chainId: config.chainId,
+        height: block.height,
+        parentHash: block.prevHash,
+        merkleRoot: block.merkleRoot,
+        timestamp: block.timestamp,
+        target: BigInt("0x" + w.target),
+        nonce: w.nonce,
+      },
+      expected,
+      config.chainId,
+    );
+  } catch (err) {
+    if (err instanceof PowError) throw new ChainError(err.code, err.message);
+    throw err;
+  }
+}
+
+// Mines the work for a block under a 'hybrid-v1' chain and returns the block with work and hash set.
+export function withWork(block, config, parent, chain = null, maxAttempts = 1_000_000) {
+  const target = expectedTarget(config, parent, chain, block.height);
+  const found = mine(
+    { chainId: config.chainId, height: block.height, parentHash: block.prevHash, merkleRoot: block.merkleRoot, timestamp: block.timestamp, target, nonce: 0 },
+    maxAttempts,
+  );
+  const out = { ...block, work: { nonce: found.nonce, target: target.toString(16) } };
+  out.hash = blockHashOf(out);
+  return out;
 }
 
 // Checks that the commit certificate was signed by validators holding more than two thirds of the weight
@@ -251,13 +350,14 @@ export async function verifyCertificate(chainId, parentState, block, maxShareBps
 
 // Validates one block against its parent and returns the state after it. Throws ChainError on any problem.
 // It never modifies `state`. It does not check the certificate: see applyCommitted for that.
-export async function applyBlock(state, block, parent, config) {
+export async function applyBlock(state, block, parent, config, chain = null) {
   if (block === null || typeof block !== "object" || !Array.isArray(block.txs) || !Array.isArray(block.evidence)) {
     throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
   }
   if (block.height !== parent.height + 1) throw new ChainError("BAD_HEIGHT", "ارتفاع الكتلة غير متسلسل.");
   if (block.prevHash !== parent.hash) throw new ChainError("BAD_PARENT", "الكتلة لا تشير إلى الكتلة السابقة الصحيحة.");
   if (block.hash !== blockHashOf(block)) throw new ChainError("BAD_HASH", "بصمة الكتلة لا تطابق محتواها.");
+  if (config.rules === RULES_HYBRID) checkBlockWork(block, config, parent, chain);
   for (const tx of block.txs) {
     if (canonicalJson(tx) !== canonicalJson(normalizeTx(tx))) {
       throw new ChainError("BAD_TX", "المعاملة تحتوي على حقول غير مسموحة.");
@@ -268,6 +368,10 @@ export async function applyBlock(state, block, parent, config) {
   }
   if (block.evidenceRoot !== evidenceRootOf(block.evidence)) {
     throw new ChainError("BAD_EVIDENCE_ROOT", "جذر الأدلة لا يطابق محتواها.");
+  }
+  // Timestamps must strictly increase along the chain, so history cannot be reordered or stamped out of time.
+  if (!Number.isSafeInteger(block.timestamp) || !(block.timestamp > parent.timestamp)) {
+    throw new ChainError("BAD_TIMESTAMP", "الطابع الزمني يجب أن يزيد عن طابع الكتلة السابقة.");
   }
 
   const next = await cloneState(state);
@@ -299,9 +403,9 @@ export async function applyBlock(state, block, parent, config) {
 }
 
 // A block is accepted only with a valid certificate for the validator set that was active before it.
-export async function applyCommitted(state, block, parent, config) {
+export async function applyCommitted(state, block, parent, config, chain = null) {
   await verifyCertificate(config.chainId, state, block, config.maxShareBps);
-  return applyBlock(state, block, parent, config);
+  return applyBlock(state, block, parent, config, chain);
 }
 
 // Rebuilds the full state from genesis. Used on startup and when syncing from a peer.
@@ -312,10 +416,10 @@ export async function replayChain(blocks, config) {
     throw new ChainError("BAD_GENESIS", "الكتلة الأولى لا تطابق الكتلة التأسيسية.");
   }
   let state = genesisState(config);
-  let parent = { height: 0, hash: genesis.hash };
+  let parent = genesis;
   for (const block of blocks.slice(1)) {
-    state = await applyCommitted(state, block, parent, config);
-    parent = { height: block.height, hash: block.hash };
+    state = await applyCommitted(state, block, parent, config, blocks);
+    parent = block;
   }
   return state;
 }

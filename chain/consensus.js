@@ -32,6 +32,10 @@ import { proposerFor, hasQuorum, hasOneThird } from "./weights.js";
 
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_ROUND_AHEAD = 100;
+// Our own proposal and votes are re-sent this often until the height commits, so a lost message
+// cannot stall a round forever. Receivers ignore duplicates, so re-sending does not flood the network.
+export const RESEND_MS = 2000;
+const RESEND_ROUND_WINDOW = 8; // only the last few rounds are re-sent, which bounds the outbox
 const isRound = (r) => Number.isInteger(r) && r >= 0;
 
 export class Consensus {
@@ -42,6 +46,8 @@ export class Consensus {
     this.height = null;
     this.vset = null;
     this.round = 0;
+    this.outbox = new Map(); // `${kind}|${round}|${type}` -> { round, message } of our own messages
+    this.lastResend = 0;
   }
 
   get chainId() {
@@ -56,6 +62,7 @@ export class Consensus {
     this.height = height;
     this.round = 0;
     this.roundStarted = Date.now();
+    this.outbox = new Map();
     this.lock = null; // { round, block }
     this.valid = null; // { round, block, polka } : latest polka seen, re-proposed if we propose
     this.proposals = new Map(); // round -> proposal
@@ -109,6 +116,23 @@ export class Consensus {
     }
     await this.step();
     if (this.isCurrent() && Date.now() - this.roundStarted >= this.roundMs) await this.timeout();
+    this.resend();
+  }
+
+  // Re-sends our recent messages for this height. Stops being needed once the height commits,
+  // because ensureHeight then clears the outbox.
+  resend() {
+    if (!this.keys || this.outbox.size === 0) return;
+    const now = Date.now();
+    if (now - this.lastResend < RESEND_MS) return;
+    this.lastResend = now;
+    for (const [key, entry] of this.outbox) {
+      if (entry.round < this.round - RESEND_ROUND_WINDOW) {
+        this.outbox.delete(key);
+        continue;
+      }
+      this.node.gossip("/consensus", entry.message);
+    }
   }
 
   async timeout() {
@@ -145,7 +169,9 @@ export class Consensus {
     );
     const proposal = { height, round, polkaRound, polka, block, from: this.keys.publicKey, signature };
     if ((await this.onProposal(proposal)) === "new") {
-      this.node.gossip("/consensus", { kind: "proposal", payload: proposal });
+      const message = { kind: "proposal", payload: proposal };
+      this.outbox.set(`proposal|${round}`, { round, message });
+      this.node.gossip("/consensus", message);
     }
   }
 
@@ -274,7 +300,9 @@ export class Consensus {
     );
     const vote = { type, height: this.height, round, blockHash, validator: this.keys.publicKey, signature };
     await this.record(vote);
-    this.node.gossip("/consensus", { kind: "vote", payload: vote });
+    const message = { kind: "vote", payload: vote };
+    this.outbox.set(`vote|${round}|${type}`, { round, message });
+    this.node.gossip("/consensus", message);
     return true;
   }
 

@@ -254,7 +254,7 @@ export class ChainNode {
       evidence,
     });
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
-    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis) : block;
+    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis, this.tip, this.blocks) : block;
   }
 
   // ---------- Evidence ----------
@@ -349,7 +349,7 @@ export class ChainNode {
     if (!(block.timestamp <= Date.now() + MAX_CLOCK_DRIFT_MS)) {
       throw new ChainError("BAD_TIMESTAMP", "الكتلة مختومة بوقت أبعد من الساعة المسموحة.");
     }
-    const state = await applyCommitted(this.state, block, this.tip, this.genesis);
+    const state = await applyCommitted(this.state, block, this.tip, this.genesis, this.blocks);
     await this.commitBlock(block, state);
     this.gossip("/block", block, fromUrl);
     return { accepted: true, height: block.height };

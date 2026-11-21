@@ -201,7 +201,7 @@ export class Consensus {
     if (!(p.block.timestamp <= Date.now() + MAX_CLOCK_DRIFT_MS)) {
       throw new ChainError("BAD_TIMESTAMP", "الكتلة مختومة بوقت أبعد من الساعة المسموحة.");
     }
-    const state = await applyBlock(this.node.state, p.block, this.node.tip, this.node.genesis);
+    const state = await applyBlock(this.node.state, p.block, this.node.tip, this.node.genesis, this.node.blocks);
     this.proposals.set(p.round, p);
     this.blocks.set(p.block.hash, { block: p.block, state });
     this.noteSeen(p.from, p.round);

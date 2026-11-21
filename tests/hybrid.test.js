@@ -64,7 +64,7 @@ test("genesis rejects an unknown rule set, a missing or zero target, and a targe
 test("a hybrid block mined for its chain is accepted and certified", async () => {
   const s = await setup("snn-hybrid-ok");
   const pay = await signedTransfer(s.alice, s.bob.address, "3", 0);
-  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [pay] }), s.config);
+  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [pay] }), s.config, s.genesis);
   const parent = { height: 0, hash: s.genesis.hash, timestamp: T0 };
   const state1 = await applyCommitted(s.state0, await certify(block, s.keys, s.config.chainId), parent, s.config);
   assert.equal(state1.ledger.balanceOf(s.bob.address).toString(), "103000000");
@@ -81,7 +81,7 @@ test("a hybrid block without work is refused with POW_MISSING", async () => {
 
 test("work with an invalid nonce is refused even when the block hash is consistent", async () => {
   const s = await setup("snn-hybrid-badnonce");
-  const good = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config);
+  const good = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config, s.genesis);
   // Find a nonce that does not meet the target, and recompute the hash so only the work is wrong.
   let nonce = 0;
   const target = BigInt("0x" + EASY);
@@ -98,23 +98,23 @@ test("work with an invalid nonce is refused even when the block hash is consiste
 
 test("a block that states an easier target than the chain requires is refused", async () => {
   const s = await setup("snn-hybrid-easy");
-  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config);
+  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config, s.genesis);
   const easier = { ...block, work: { nonce: block.work.nonce, target: "f".repeat(64) } };
   easier.hash = blockHashOf(easier);
-  assert.throws(() => checkBlockWork(easier, s.config), { code: "POW_BAD_TARGET" });
+  assert.throws(() => checkBlockWork(easier, s.config, s.genesis), { code: "POW_BAD_TARGET" });
 });
 
 test("work mined for another chain is refused on this chain", async () => {
   const a = await setup("snn-hybrid-chain-a");
   const b = await setup("snn-hybrid-chain-b");
-  const mined = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: a.genesis.hash, txs: [] }), a.config);
+  const mined = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: a.genesis.hash, txs: [] }), a.config, a.genesis);
   // Same block bytes, checked against chain B: the header there names chain B, so the work must fail.
-  assert.throws(() => checkBlockWork(mined, b.config), { code: "POW_INVALID" });
+  assert.throws(() => checkBlockWork(mined, b.config, b.genesis), { code: "POW_INVALID" });
 });
 
 test("tampering with the work changes the block hash, so the block is refused before any work check", async () => {
   const s = await setup("snn-hybrid-tamper");
-  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config);
+  const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [] }), s.config, s.genesis);
   const tampered = { ...block, work: { nonce: block.work.nonce + 1, target: EASY } };
   await assert.rejects(
     applyCommitted(s.state0, await certify(tampered, s.keys, s.config.chainId), { height: 0, hash: s.genesis.hash, timestamp: T0 }, s.config),

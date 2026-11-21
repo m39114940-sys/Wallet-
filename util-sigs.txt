@@ -1,0 +1,11 @@
+node_modules/@ethereumjs/util/dist/esm/account.d.ts:60:    constructor(nonce?: bigint | null, balance?: bigint | null, storageRoot?: Uint8Array | null, codeHash?: Uint8Array | null, codeSize?: number | null, version?: number | null);
+node_modules/@ethereumjs/util/dist/esm/account.d.ts-61-    private _validate;
+node_modules/@ethereumjs/util/dist/esm/account.d.ts-62-    /**
+node_modules/@ethereumjs/util/dist/esm/account.d.ts-63-     * Returns an array of Uint8Arrays of the raw bytes for the account, in order.
+node_modules/@ethereumjs/util/dist/esm/account.d.ts-64-     */
+--
+node_modules/@ethereumjs/util/dist/esm/address.d.ts:7:    constructor(bytes: Uint8Array);
+node_modules/@ethereumjs/util/dist/esm/address.d.ts-8-    /**
+node_modules/@ethereumjs/util/dist/esm/address.d.ts-9-     * Is address equal to another.
+node_modules/@ethereumjs/util/dist/esm/address.d.ts-10-     */
+node_modules/@ethereumjs/util/dist/esm/address.d.ts-11-    equals(address: Address): boolean;

@@ -11,16 +11,19 @@ import { createTlsIdentity } from "../node/tls.js";
 
 const CHAIN = "snn-connect-test";
 
-async function startServer() {
+async function startServer(activePeers = []) {
   const tls = createTlsIdentity("snn-connect-server");
   const identity = await createNodeIdentity();
   const client = createTlsIdentity("snn-connect-client");
+  const peerBook = new PeerBook({ trusted: new Map([["dummy", "k"]]), maxActive: 100 });
+  for (const url of activePeers) peerBook.admit(url, "dummy");
   const node = {
     genesis: { chainId: CHAIN },
     nodeIdentity: identity,
     handshake: new Handshake({ chainId: CHAIN, verifierId: identity.nodeId }),
     authenticatedPeers: new Map(),
     pins: new Set([client.fingerprint]),
+    peerBook,
     status: () => ({ ok: true }),
     run: async (fn) => fn(),
     guard: new PeerGuard(),
@@ -102,5 +105,35 @@ test("maintainPeers dials trusted entries that have an address, and skips entrie
     assert.equal(d.peers.size, 1);
   } finally {
     server.close();
+  }
+});
+
+test("gossip adds learned candidates, and candidates are admitted only if trusted", async () => {
+  const stranger = await startServer();
+  const deadUrl = "https://127.0.0.1:1";
+  const server = await startServer([stranger.url, deadUrl]); // S knows an untrusted node and a dead address
+  const { server: sv, identity: serverId, tls, url, client } = server;
+  try {
+    const me = await createNodeIdentity();
+    const trusted = new Map([[serverId.nodeId, { publicKey: serverId.publicKey, tlsFingerprint: tls.fingerprint }]]);
+    const d = dialer(me, client, trusted);
+    d.trustedNodes = new Map();
+    d.connectPeer = ChainNode.prototype.connectPeer.bind(d);
+    d.selfUrl = null;
+    // Step 1: dial S (it is trusted, so it is admitted), then gossip pulls its list.
+    await d.connectPeer(url);
+    const round = Object.assign(d, { pins: new Set([tls.fingerprint]), tlsIdentity: { key: client.key, cert: client.cert } });
+    // Round 1 gossips and stores the two learned addresses as candidates.
+    await ChainNode.prototype.maintainPeers.call(round);
+    assert.equal(d.peerBook.candidateUrls().length, 2);
+    // Round 2 tries the candidates: the untrusted node and the dead address are both dropped.
+    await ChainNode.prototype.maintainPeers.call(round);
+    assert.equal(d.peerBook.isActive(stranger.url), false);
+    assert.equal(d.peerBook.isActive(deadUrl), false);
+    assert.equal(d.peerBook.candidateUrls().length, 0);
+    assert.equal(d.peerBook.isActive(url), true);
+  } finally {
+    sv.close();
+    stranger.server.close();
   }
 });

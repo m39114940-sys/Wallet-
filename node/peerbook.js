@@ -10,6 +10,8 @@
 // - Addresses must be https URLs of reasonable length. Anything else is rejected.
 
 const MAX_URL_LENGTH = 200;
+const REJECT_MS = 10 * 60 * 1000; // a rejected address is ignored for this long, even if gossip repeats it
+const MAX_REJECTED = 1024;
 
 export class PeerBookError extends Error {
   constructor(code, message) {
@@ -37,7 +39,9 @@ export function normalizeUrl(url) {
 
 export class PeerBook {
   // trusted: Map nodeId -> publicKey (PEM or DER string) from the operator's trust list.
-  constructor({ trusted = new Map(), maxCandidates = 64, maxActive = 16, selfUrl = null } = {}) {
+  constructor({ trusted = new Map(), maxCandidates = 64, maxActive = 16, selfUrl = null, now = () => Date.now() } = {}) {
+    this.now = now;
+    this.rejected = new Map(); // url -> time until which it is ignored
     this.trusted = new Map(trusted);
     this.maxCandidates = maxCandidates;
     this.maxActive = maxActive;
@@ -58,6 +62,7 @@ export class PeerBook {
         continue; // invalid entries are skipped, not fatal
       }
       if (url === this.selfUrl || this.active.has(url) || this.candidates.has(url)) continue;
+      if ((this.rejected.get(url) ?? 0) > this.now()) continue;
       if (this.candidates.size >= this.maxCandidates) break;
       this.candidates.add(url);
       added += 1;
@@ -91,6 +96,14 @@ export class PeerBook {
 
   activeUrls() {
     return [...this.active.keys()];
+  }
+
+  // A candidate that failed to connect, or was not trusted, is removed. Gossip can supply it again later.
+  reject(url) {
+    const key = normalizeUrl(url);
+    this.candidates.delete(key);
+    if (this.rejected.size >= MAX_REJECTED) this.rejected.delete(this.rejected.keys().next().value);
+    this.rejected.set(key, this.now() + REJECT_MS);
   }
 
   candidateUrls() {

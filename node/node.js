@@ -45,6 +45,8 @@ const PEER_TIMEOUT_MS = 3000;
 const MAX_MEMPOOL = 5000;
 const TICK_MS = 50;
 const DIAL_INTERVAL_MS = 10_000; // how often trusted peers with an address are dialed again if they are not active
+const DIALS_PER_ROUND = 4; // candidates tried per round, so a flood of candidates cannot stall the node
+const MAX_PEER_LIST = 50; // addresses served by /peers and accepted from one reply
 const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
 const RATE_PER_SEC = 200; // requests per second refilled per remote address
 const RATE_BURST = 400;
@@ -119,7 +121,10 @@ export class ChainNode {
     return result;
   }
 
-  // Dials trusted peers that have an address and are not active yet. Failures are normal and ignored.
+  // One maintenance round. Failures are normal and ignored.
+  //  1. Trusted peers with an address that are not active yet.
+  //  2. A few learned candidates. Each one is admitted only if its identity is trusted.
+  //  3. Gossip: ask each active peer for its list. The answer only adds candidates.
   async maintainPeers() {
     if (this.dialing) return;
     this.dialing = true;
@@ -127,6 +132,16 @@ export class ChainNode {
       for (const entry of this.trustedNodes.values()) {
         if (!entry.url || this.peerBook.isActive(entry.url)) continue;
         await this.connectPeer(entry.url).catch(() => null);
+      }
+      for (const url of this.peerBook.candidateUrls().slice(0, DIALS_PER_ROUND)) {
+        if (this.peerBook.isActive(url)) continue;
+        await this.connectPeer(url).catch(() => this.peerBook.reject(url));
+      }
+      for (const url of this.peerBook.activeUrls()) {
+        const res = await peerRequest({
+          url, path: "/peers", pins: this.pins, identity: this.tlsIdentity, timeoutMs: PEER_TIMEOUT_MS,
+        }).catch(() => null);
+        if (res?.status === 200 && Array.isArray(res.body?.peers)) this.peerBook.learn(res.body.peers.slice(0, MAX_PEER_LIST));
       }
     } finally {
       this.dialing = false;
@@ -535,6 +550,11 @@ export function createHttpServer(node, tlsOptions = null) {
         return sendJson(res, 200, { authenticated: peer.nodeId });
       }
       if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
+      // Only admitted peers are listed; candidates that were never verified are not passed on.
+      if (req.method === "GET" && pathname === "/peers") {
+        const peers = [...(node.selfUrl ? [node.selfUrl] : []), ...(node.peerBook?.activeUrls() ?? [])];
+        return sendJson(res, 200, { peers: peers.slice(0, MAX_PEER_LIST) });
+      }
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);
         const limit = Number(url.searchParams.get("limit") ?? MAX_PAGE);

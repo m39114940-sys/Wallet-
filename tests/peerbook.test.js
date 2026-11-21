@@ -69,3 +69,13 @@ test("learn rejects a non-array list", () => {
 test("normalizeUrl canonicalises host and trailing slash", () => {
   assert.equal(normalizeUrl("https://Host.Example:8443/"), "https://host.example:8443");
 });
+
+test("a rejected address is not learned again until the rejection expires", () => {
+  let t = 0;
+  const book = new PeerBook({ trusted: TRUSTED, now: () => t });
+  book.learn(["https://bad.example"]);
+  book.reject("https://bad.example");
+  assert.equal(book.learn(["https://bad.example"]), 0);
+  t = 10 * 60 * 1000 + 1;
+  assert.equal(book.learn(["https://bad.example"]), 1);
+});

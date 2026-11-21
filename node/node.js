@@ -14,7 +14,7 @@ import http from "node:http";
 import https from "node:https";
 import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
 import { Handshake } from "./handshake.js";
-import { RULES_HYBRID, withWork } from "../chain/core.js";
+import { RULES_HYBRID, withWork, requireChainBinding } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
 import { PeerBook } from "./peerbook.js";
@@ -282,6 +282,7 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
+    requireChainBinding(tx, this.genesis);
     await trial.ledger.transfer(tx); // throws LedgerError with a specific code if invalid
 
     this.mempool.set(id, tx);
@@ -299,6 +300,7 @@ export class ChainNode {
     const included = [];
     for (const tx of this.mempool.values()) {
       try {
+        requireChainBinding(tx, this.genesis);
         await trial.ledger.transfer(tx);
         included.push(tx);
       } catch {
@@ -382,6 +384,7 @@ export class ChainNode {
     const trial = await cloneState(this.state);
     for (const [id, tx] of [...this.mempool]) {
       try {
+        requireChainBinding(tx, this.genesis);
         await trial.ledger.transfer(tx);
       } catch {
         this.mempool.delete(id);

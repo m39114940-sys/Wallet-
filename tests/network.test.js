@@ -224,9 +224,11 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   assert.equal(foreignSync.body.code, "PEER_NOT_ALLOWED");
 
   // 8. A flood from one address is throttled, and the node recovers once the bucket refills.
-  const flood = await Promise.all(
-    Array.from({ length: 600 }, () => get(v1, "/status").then((r) => r.status)),
-  );
+  // Sent in batches of 50 so the connections do not overflow the listen backlog before reaching the limiter.
+  const flood = [];
+  for (let batch = 0; batch < 40; batch++) {
+    flood.push(...(await Promise.all(Array.from({ length: 50 }, () => get(v1, "/status").then((r) => r.status)))));
+  }
   assert.ok(flood.includes(429), "a burst above the limit is refused");
   await waitFor(async () => (await get(v1, "/status")).status === 200, "rate limit recovers", 10_000);
 });

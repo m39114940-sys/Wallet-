@@ -33,7 +33,7 @@ export class ChainError extends Error {
 // so "2.5" and "2.50" cannot produce two different transaction ids for the same transfer.
 export function normalizeTx(tx) {
   if (tx === null || typeof tx !== "object") throw new ChainError("BAD_TX", "المعاملة غير صالحة.");
-  return {
+  const normalized = {
     from: tx.from,
     to: tx.to,
     amount: formatAmount(parseAmount(tx.amount)),
@@ -41,6 +41,9 @@ export function normalizeTx(tx) {
     publicKey: tx.publicKey,
     signature: tx.signature,
   };
+  // Present only on chain-bound transfers, so the id of a legacy transfer does not change.
+  if (tx.chainId !== undefined) normalized.chainId = tx.chainId;
+  return normalized;
 }
 
 export const txId = (tx) => sha256Hex(canonicalJson(normalizeTx(tx)));
@@ -350,6 +353,18 @@ export async function verifyCertificate(chainId, parentState, block, maxShareBps
 
 // Validates one block against its parent and returns the state after it. Throws ChainError on any problem.
 // It never modifies `state`. It does not check the certificate: see applyCommitted for that.
+// On a chain with rules that require it, every transfer must be bound to this chain's id.
+// Testnet rules are unchanged, so Testnet still accepts legacy (unbound) transfers.
+// A transfer that names a chain must name this one, on every chain. Legacy transfers have no name,
+// so they are refused only where the rules require binding.
+export function requireChainBinding(tx, config) {
+  if (tx.chainId !== undefined) {
+    if (tx.chainId !== config.chainId) throw new ChainError("TX_UNBOUND", "المعاملة مرتبطة بسلسلة أخرى.");
+    return;
+  }
+  if (config.rules === RULES_HYBRID) throw new ChainError("TX_UNBOUND", "المعاملة غير مرتبطة بمعرّف هذه السلسلة.");
+}
+
 export async function applyBlock(state, block, parent, config, chain = null) {
   if (block === null || typeof block !== "object" || !Array.isArray(block.txs) || !Array.isArray(block.evidence)) {
     throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
@@ -393,6 +408,7 @@ export async function applyBlock(state, block, parent, config, chain = null) {
   }
 
   for (const tx of block.txs) {
+    requireChainBinding(tx, config);
     try {
       await next.ledger.transfer(tx);
     } catch (err) {

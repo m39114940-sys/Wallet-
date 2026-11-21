@@ -71,7 +71,7 @@ const identity = () => ({ key: validators[0].tls.key, cert: validators[0].tls.ce
 // A validator only proposes when it has pending work, so one transaction is submitted per height.
 // Each transaction goes to every node, so one slow node cannot hold it back.
 async function submitEverywhere(nonce) {
-  const tx = await signedTransfer(alice, bob.address, "1", nonce);
+  const tx = await signedTransfer(alice, bob.address, "1", nonce, HYBRID_CHAIN);
   for (const url of globalThis.urls) {
     await peerRequest({ url, method: "POST", path: "/tx", body: tx, pins, identity: identity(), timeoutMs: 3000 }).catch(() => {});
   }

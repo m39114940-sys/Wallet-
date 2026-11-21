@@ -16,6 +16,8 @@ const DIGITS_PATTERN = /^(0|[1-9][0-9]{0,17})$/; // up to 18 digits, so a stored
 const PUBLIC_KEY_HEX = /^[0-9a-f]{64}$/;
 const SIGNATURE_HEX = /^[0-9a-f]{128}$/;
 const RECORD_FIELDS = ["height", "type", "from", "to", "amount", "nonce", "publicKey", "signature"];
+// Transfers signed under v2 also store the chain id they are bound to.
+const CHAIN_FIELD = "chainId";
 
 export class LedgerError extends Error {
   constructor(code, message) {
@@ -60,7 +62,10 @@ const corrupt = (detail) => new LedgerError("LEDGER_CORRUPT", `سجل المحف
 function assertRecordShape(record, expectedHeight) {
   if (!isPlainObject(record)) throw corrupt("سجل غير صالح.");
   const keys = Object.keys(record).sort();
-  if (keys.join() !== [...RECORD_FIELDS].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
+  const allowed = record.type === "transfer" && Object.hasOwn(record, CHAIN_FIELD)
+    ? [...RECORD_FIELDS, CHAIN_FIELD]
+    : RECORD_FIELDS;
+  if (keys.join() !== [...allowed].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
   if (record.height !== expectedHeight) throw corrupt("ترقيم المعاملات غير متسلسل.");
   if (!DIGITS_PATTERN.test(String(record.amount)) || String(record.amount) === "0") {
     throw corrupt("مبلغ المعاملة غير صالح.");
@@ -143,6 +148,7 @@ export class Ledger {
             nonce: record.nonce,
             publicKey: record.publicKey,
             signature: record.signature,
+            chainId: record.chainId,
           });
         }
       }
@@ -197,7 +203,7 @@ export class Ledger {
   // Order of checks: shape, then signature, then nonce and funds. Signature comes first so that unauthenticated
   // input learns nothing about account state. Nonce and funds are checked after the last await, so the state
   // they read is the state they change.
-  async transfer({ from, to, amount, nonce, publicKey, signature }) {
+  async transfer({ from, to, amount, nonce, publicKey, signature, chainId }) {
     if (!isValidAddress(from)) {
       throw new LedgerError("INVALID_SENDER", "عنوان المرسل غير صالح.");
     }
@@ -225,6 +231,7 @@ export class Ledger {
       nonce,
       publicKey,
       signature,
+      chainId,
     });
     if (!verdict.ok) {
       throw new LedgerError(verdict.code, verdict.message);
@@ -242,7 +249,9 @@ export class Ledger {
     this.#balances.set(from, senderBalance - units);
     this.#balances.set(to, this.balanceOf(to) + units);
     this.#nonces.set(from, expected + 1);
-    return this.#record({ type: "transfer", from, to, amount: units, nonce: expected, publicKey, signature });
+    const fields = { type: "transfer", from, to, amount: units, nonce: expected, publicKey, signature };
+    if (chainId !== undefined) fields.chainId = chainId;
+    return this.#record(fields);
   }
 
   #record(tx) {

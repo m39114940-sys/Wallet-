@@ -63,7 +63,7 @@ test("genesis rejects an unknown rule set, a missing or zero target, and a targe
 
 test("a hybrid block mined for its chain is accepted and certified", async () => {
   const s = await setup("snn-hybrid-ok");
-  const pay = await signedTransfer(s.alice, s.bob.address, "3", 0);
+  const pay = await signedTransfer(s.alice, s.bob.address, "3", 0, "snn-hybrid-ok");
   const block = withWork(buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [pay] }), s.config, s.genesis);
   const parent = { height: 0, hash: s.genesis.hash, timestamp: T0 };
   const state1 = await applyCommitted(s.state0, await certify(block, s.keys, s.config.chainId), parent, s.config);

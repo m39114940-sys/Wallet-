@@ -14,6 +14,7 @@ import http from "node:http";
 import https from "node:https";
 import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
 import { Handshake } from "./handshake.js";
+import { RULES_HYBRID, withWork } from "../chain/core.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
@@ -245,13 +246,15 @@ export class ChainNode {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
       }
     }
-    return buildBlock({
+    const block = buildBlock({
       height: this.tip.height + 1,
       timestamp: Math.max(Date.now(), this.tip.timestamp + 1), // milliseconds, strictly increasing
       prevHash: this.tip.hash,
       txs: included,
       evidence,
     });
+    // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
+    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis) : block;
   }
 
   // ---------- Evidence ----------

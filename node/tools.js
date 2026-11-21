@@ -21,7 +21,8 @@ export async function generateValidatorKey() {
 }
 
 // passphrase: when set, every validator file is encrypted with it. When null, files are plaintext (tests only).
-export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS, passphrase = null } = {}) {
+// rules and powTarget are optional; both absent gives the Testnet rules.
+export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_VALIDATORS, maxShareBps = DEFAULT_MAX_SHARE_BPS, passphrase = null, rules, powTarget } = {}) {
   mkdirSync(dir, { recursive: true });
   const validators = [];
   for (let i = 1; i <= count; i++) {
@@ -39,6 +40,8 @@ export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_V
       tlsFingerprint: v.tls.fingerprint,
     })),
     maxShareBps,
+    rules,
+    powTarget,
   });
   writeFileSync(join(dir, "genesis.json"), JSON.stringify(genesis, null, 2));
   validators.forEach((key, i) => {

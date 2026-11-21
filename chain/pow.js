@@ -9,8 +9,15 @@
 // set in this module; they are chosen per network in its genesis config and need owner approval.
 
 import { createHash } from "node:crypto";
-import { ChainError } from "./core.js";
 import { canonicalJson } from "./crypto.js";
+
+// Errors carry a code; core.js turns them into ChainError at the block boundary.
+export class PowError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
 
 const TWO_256 = 1n << 256n;
 const DOMAIN = "snn-pow-v1";
@@ -47,13 +54,13 @@ export function meetsTarget(hash, target) {
 // Checks a block's work against the target the chain rules require at that height.
 // The caller passes the expected target; a header that states a different target is rejected.
 export function validateWork(header, expectedTarget, chainId) {
-  if (header.chainId !== chainId) throw new ChainError("POW_WRONG_CHAIN", "إثبات العمل ينتمي إلى سلسلة أخرى.");
-  if (header.target !== expectedTarget) throw new ChainError("POW_BAD_TARGET", "الهدف في الترويسة لا يطابق قاعدة الشبكة.");
+  if (header.chainId !== chainId) throw new PowError("POW_WRONG_CHAIN", "إثبات العمل ينتمي إلى سلسلة أخرى.");
+  if (header.target !== expectedTarget) throw new PowError("POW_BAD_TARGET", "الهدف في الترويسة لا يطابق قاعدة الشبكة.");
   if (!Number.isInteger(header.nonce) || header.nonce < 0 || header.nonce >= 2 ** 53) {
-    throw new ChainError("POW_BAD_NONCE", "قيمة nonce غير صالحة.");
+    throw new PowError("POW_BAD_NONCE", "قيمة nonce غير صالحة.");
   }
   const hash = workHash(header);
-  if (!meetsTarget(hash, expectedTarget)) throw new ChainError("POW_INVALID", "إثبات العمل لا يستوفي الهدف.");
+  if (!meetsTarget(hash, expectedTarget)) throw new PowError("POW_INVALID", "إثبات العمل لا يستوفي الهدف.");
   return hash;
 }
 
@@ -63,13 +70,13 @@ export function mine(header, maxAttempts = 1_000_000) {
     const candidate = { ...header, nonce };
     if (meetsTarget(workHash(candidate), header.target)) return candidate;
   }
-  throw new ChainError("POW_NOT_FOUND", "لم يُعثر على nonce ضمن الحد الأقصى للمحاولات.");
+  throw new PowError("POW_NOT_FOUND", "لم يُعثر على nonce ضمن الحد الأقصى للمحاولات.");
 }
 
 // Next target from the time the last window took. Faster than expected raises difficulty (lower target).
 // The change per window is clamped to [1/MAX, MAX] and the result stays within [minTarget, maxTarget].
 export function nextTarget({ previousTarget, actualSeconds, expectedSeconds, minTarget, maxTarget }) {
-  if (actualSeconds <= 0n || expectedSeconds <= 0n) throw new ChainError("POW_BAD_WINDOW", "زمن النافذة غير صالح.");
+  if (actualSeconds <= 0n || expectedSeconds <= 0n) throw new PowError("POW_BAD_WINDOW", "زمن النافذة غير صالح.");
   let actual = actualSeconds;
   const lower = expectedSeconds / MAX_RETARGET_FACTOR;
   const upper = expectedSeconds * MAX_RETARGET_FACTOR;
@@ -85,7 +92,7 @@ export function nextTarget({ previousTarget, actualSeconds, expectedSeconds, min
 
 // Median of the last timestamps (Bitcoin-style median time past). A block must be later than this.
 export function medianTimePast(timestamps) {
-  if (!Array.isArray(timestamps) || timestamps.length === 0) throw new ChainError("POW_BAD_WINDOW", "لا توجد طوابع زمنية.");
+  if (!Array.isArray(timestamps) || timestamps.length === 0) throw new PowError("POW_BAD_WINDOW", "لا توجد طوابع زمنية.");
   const sorted = [...timestamps].sort((a, b) => a - b);
   return sorted[Math.floor(sorted.length / 2)];
 }

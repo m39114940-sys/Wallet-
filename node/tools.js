@@ -9,6 +9,7 @@ import { createAccount, toHex } from "../js/signing.js";
 import { createGenesisConfig } from "../chain/core.js";
 import { createTlsIdentity } from "./tls.js";
 import { encryptKeyfile } from "./keyfile.js";
+import { createNodeIdentity, saveNodeIdentity } from "./identity.js";
 
 export const DEFAULT_VALIDATORS = 4;
 export const DEFAULT_MAX_SHARE_BPS = 4000; // 40%, for a 4-validator test network
@@ -49,6 +50,18 @@ export async function initNetwork(dir, chainId, allocations, { count = DEFAULT_V
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  if (process.argv[2] === "identity") {
+    const file = process.argv[3];
+    const passphrase = process.env.SNN_IDENTITY_PASSPHRASE;
+    if (!file || !passphrase) {
+      console.error("usage: SNN_IDENTITY_PASSPHRASE=... node node/tools.js identity <file>");
+      process.exit(2);
+    }
+    const identity = await createNodeIdentity();
+    saveNodeIdentity(file, identity, passphrase);
+    console.log(JSON.stringify({ nodeId: identity.nodeId, publicKey: identity.publicKey, file }));
+    process.exit(0);
+  }
   const [command, dir, chainId, ...allocations] = process.argv.slice(2);
   if (command !== "init" || !dir || !chainId || allocations.length === 0) {
     console.error("usage: node node/tools.js init <dir> <chainId> <address> [<address> ...]");

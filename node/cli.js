@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { ChainNode, createHttpServer } from "./node.js";
 import { fingerprintOfPem } from "./tls.js";
 import { openValidatorKey } from "./keyfile.js";
+import { loadNodeIdentity } from "./identity.js";
 
 function parseArgs(argv) {
   const args = { peers: [] };
@@ -59,6 +60,8 @@ const node = new ChainNode({
   genesis,
   validator: { publicKey: validator.publicKey, privateKeyDer: validator.privateKeyDer },
   tlsIdentity: { key: validator.tls.key, cert: validator.tls.cert },
+  // Optional Ed25519 node identity, sealed with SNN_IDENTITY_PASSPHRASE.
+  nodeIdentity: args.identity ? loadNodeIdentity(args.identity, process.env.SNN_IDENTITY_PASSPHRASE) : null,
   // --loss-rate is for tests only: it drops that fraction of outbound peer messages.
   lossRate: Number(args["loss-rate"] ?? 0),
   selfUrl: args.self ?? `https://${host}:${port}`,

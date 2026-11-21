@@ -80,3 +80,36 @@ export function openValidatorKey(file, passphrase) {
   if (isEncryptedKeyfile(file)) return decryptKeyfile(file, passphrase);
   return file;
 }
+
+// Seals an arbitrary secret string with the same scheme as validator files. The label is bound as
+// associated data, so a sealed secret cannot be moved into a file with a different label.
+export function sealSecret(secret, label, passphrase, iterations = DEFAULT_KEYFILE_ITERATIONS) {
+  checkPassphrase(passphrase);
+  const salt = randomBytes(16);
+  const iv = randomBytes(12);
+  const key = deriveKey(passphrase, salt, iterations);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(label, "utf8"));
+  const data = Buffer.concat([cipher.update(Buffer.from(secret, "utf8")), cipher.final()]);
+  return {
+    kdf: { name: "PBKDF2", hash: "SHA-256", iterations, salt: salt.toString("hex") },
+    cipher: { name: "AES-256-GCM", iv: iv.toString("hex"), data: data.toString("hex"), tag: cipher.getAuthTag().toString("hex") },
+  };
+}
+
+export function openSecret(sealed, label, passphrase) {
+  checkPassphrase(passphrase);
+  const { kdf, cipher } = sealed;
+  if (!Number.isInteger(kdf?.iterations) || kdf.iterations < MIN_ITERATIONS || kdf.iterations > MAX_ITERATIONS) {
+    throw new ChainError("BAD_KEYFILE", "عدد تكرارات KDF خارج الحدود المسموحة.");
+  }
+  try {
+    const key = deriveKey(passphrase, Buffer.from(kdf.salt, "hex"), kdf.iterations);
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(cipher.iv, "hex"));
+    decipher.setAAD(Buffer.from(label, "utf8"));
+    decipher.setAuthTag(Buffer.from(cipher.tag, "hex"));
+    return Buffer.concat([decipher.update(Buffer.from(cipher.data, "hex")), decipher.final()]).toString("utf8");
+  } catch {
+    throw new ChainError("BAD_PASSPHRASE", "كلمة المرور غير صحيحة أو السر تالف.");
+  }
+}

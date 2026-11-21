@@ -13,6 +13,9 @@ import { join } from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
+import { Handshake } from "./handshake.js";
+
+const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
@@ -45,8 +48,11 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
+    this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
+    this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
+    this.authenticatedPeers = new Map(); // nodeId -> { publicKey, at }: peers that proved their key
     this.lossRate = lossRate; // TESTING ONLY: fraction of outbound peer requests dropped at random
     this.dataDir = dataDir;
     this.genesis = genesis;
@@ -449,6 +455,23 @@ export function createHttpServer(node, tlsOptions = null) {
       const fromUrl = req.headers["x-peer-url"] || null;
 
       if (req.method === "GET" && pathname === "/status") return sendJson(res, 200, node.status());
+      if (req.method === "GET" && pathname === "/identity") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        return sendJson(res, 200, { chainId: node.genesis.chainId, nodeId: node.nodeIdentity.nodeId, publicKey: node.nodeIdentity.publicKey });
+      }
+      if (req.method === "GET" && pathname === "/challenge") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        return sendJson(res, 200, node.handshake.challenge());
+      }
+      if (req.method === "POST" && pathname === "/hello") {
+        if (!node.nodeIdentity) return sendJson(res, 404, { error: "no identity", code: "NO_IDENTITY" });
+        const peer = await node.handshake.verify(await readJson(req));
+        if (!node.authenticatedPeers.has(peer.nodeId) && node.authenticatedPeers.size >= MAX_AUTHENTICATED_PEERS) {
+          node.authenticatedPeers.delete(node.authenticatedPeers.keys().next().value);
+        }
+        node.authenticatedPeers.set(peer.nodeId, { publicKey: peer.publicKey, at: Date.now() });
+        return sendJson(res, 200, { authenticated: peer.nodeId });
+      }
       if (req.method === "GET" && pathname === "/validators") return sendJson(res, 200, node.validatorsInfo());
       if (req.method === "GET" && pathname === "/blocks") {
         const from = Number(url.searchParams.get("from") ?? 0);

@@ -6,6 +6,6 @@
   "type": "module",
   "scripts": {
     "start": "python3 -m http.server 8080",
-    "test": "node --test tests/ledger.test.js tests/keystore.test.js tests/security.test.js tests/consensus.test.js tests/chain.test.js tests/weights.test.js tests/tls.test.js tests/network.test.js tests/vrf.test.js tests/keyfile.test.js tests/attacks.test.js tests/stress.test.js tests/resend.test.js tests/lossy.test.js tests/pow.test.js"
+    "test": "node --test tests/ledger.test.js tests/keystore.test.js tests/security.test.js tests/consensus.test.js tests/chain.test.js tests/weights.test.js tests/tls.test.js tests/network.test.js tests/vrf.test.js tests/keyfile.test.js tests/attacks.test.js tests/stress.test.js tests/resend.test.js tests/lossy.test.js tests/pow.test.js tests/identity.test.js tests/separation.test.js"
   }
 }

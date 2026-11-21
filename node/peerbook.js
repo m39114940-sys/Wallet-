@@ -50,6 +50,12 @@ export class PeerBook {
     this.active = new Map(); // url -> nodeId
   }
 
+  // The node's own address, set whenever it is known, so gossip never adds us to our own candidates.
+  setSelf(url) {
+    this.selfUrl = url ? normalizeUrl(url) : null;
+    this.candidates.delete(this.selfUrl);
+  }
+
   // Gossip entry point. Returns how many new candidates were stored.
   learn(urls) {
     if (!Array.isArray(urls)) throw new PeerBookError("BAD_LIST", "peer list must be an array");

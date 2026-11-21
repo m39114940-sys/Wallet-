@@ -141,7 +141,10 @@ export class ChainNode {
         const res = await peerRequest({
           url, path: "/peers", pins: this.pins, identity: this.tlsIdentity, timeoutMs: PEER_TIMEOUT_MS,
         }).catch(() => null);
-        if (res?.status === 200 && Array.isArray(res.body?.peers)) this.peerBook.learn(res.body.peers.slice(0, MAX_PEER_LIST));
+        if (res?.status === 200 && Array.isArray(res.body?.peers)) {
+          this.peerBook.setSelf(this.selfUrl);
+          this.peerBook.learn(res.body.peers.slice(0, MAX_PEER_LIST));
+        }
       }
     } finally {
       this.dialing = false;

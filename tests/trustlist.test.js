@@ -9,7 +9,14 @@ const FP = "ab".repeat(32);
 test("a well-formed entry is accepted and keyed by node id", async () => {
   const id = await createNodeIdentity();
   const map = parseTrustList([{ nodeId: id.nodeId, publicKey: id.publicKey, tlsFingerprint: FP }]);
-  assert.deepEqual(map.get(id.nodeId), { publicKey: id.publicKey, tlsFingerprint: FP });
+  assert.deepEqual(map.get(id.nodeId), { publicKey: id.publicKey, tlsFingerprint: FP, url: null });
+});
+
+test("an optional https address is kept normalised, and a non-https one is refused", async () => {
+  const id = await createNodeIdentity();
+  const map = parseTrustList([{ nodeId: id.nodeId, publicKey: id.publicKey, tlsFingerprint: FP, url: "https://Peer.example:8443/" }]);
+  assert.equal(map.get(id.nodeId).url, "https://peer.example:8443");
+  assert.throws(() => parseTrustList([{ nodeId: id.nodeId, publicKey: id.publicKey, tlsFingerprint: FP, url: "http://x.example" }]), { code: "BAD_URL" });
 });
 
 test("a node id that does not match its public key is refused", async () => {

@@ -85,3 +85,22 @@ test("a trusted identity presenting a different TLS certificate is refused by pi
     server.close();
   }
 });
+
+test("maintainPeers dials trusted entries that have an address, and skips entries without one", async () => {
+  const { server, identity: serverId, tls, url, client } = await startServer();
+  try {
+    const me = await createNodeIdentity();
+    const trusted = new Map([
+      [serverId.nodeId, { publicKey: serverId.publicKey, tlsFingerprint: tls.fingerprint, url }],
+      ["no-address", { publicKey: serverId.publicKey, tlsFingerprint: tls.fingerprint, url: null }],
+    ]);
+    const d = dialer(me, client, trusted);
+    d.trustedNodes = trusted;
+    d.connectPeer = ChainNode.prototype.connectPeer.bind(d);
+    await ChainNode.prototype.maintainPeers.call(d);
+    assert.equal(d.peerBook.isActive(url), true);
+    assert.equal(d.peers.size, 1);
+  } finally {
+    server.close();
+  }
+});

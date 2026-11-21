@@ -44,6 +44,7 @@ const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
 const MAX_MEMPOOL = 5000;
 const TICK_MS = 50;
+const DIAL_INTERVAL_MS = 10_000; // how often trusted peers with an address are dialed again if they are not active
 const SYNC_COOLDOWN_MS = 2000; // at most one automatic sync per peer in this window
 const RATE_PER_SEC = 200; // requests per second refilled per remote address
 const RATE_BURST = 400;
@@ -118,7 +119,22 @@ export class ChainNode {
     return result;
   }
 
+  // Dials trusted peers that have an address and are not active yet. Failures are normal and ignored.
+  async maintainPeers() {
+    if (this.dialing) return;
+    this.dialing = true;
+    try {
+      for (const entry of this.trustedNodes.values()) {
+        if (!entry.url || this.peerBook.isActive(entry.url)) continue;
+        await this.connectPeer(entry.url).catch(() => null);
+      }
+    } finally {
+      this.dialing = false;
+    }
+  }
+
   start() {
+    this.dialTimer = setInterval(() => this.maintainPeers(), DIAL_INTERVAL_MS);
     this.timer = setInterval(() => {
       this.run(() => this.consensus.tick()).catch((err) => {
         // The same error would repeat every tick, so log it only when it changes.
@@ -129,6 +145,7 @@ export class ChainNode {
   }
 
   stop() {
+    if (this.dialTimer) clearInterval(this.dialTimer);
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }

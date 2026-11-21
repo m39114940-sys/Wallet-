@@ -17,6 +17,8 @@ import { Handshake } from "./handshake.js";
 import { RULES_HYBRID, withWork } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
+import { PeerBook } from "./peerbook.js";
+import { introduce } from "./handshake.js";
 import { peerFingerprintOf } from "./tls.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
@@ -52,7 +54,7 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, trustedNodes = new Map(), selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
     this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
     this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
@@ -76,6 +78,28 @@ export class ChainNode {
     this.syncedAt = new Map(); // peer url -> time of the last automatic sync
     // Trust anchors: the TLS fingerprints of the genesis validators. A peer must present one of these.
     this.pins = new Set(genesis.validators.map((v) => v.tlsFingerprint).filter((f) => f !== null));
+    // Operator trust list (non-validators): their TLS fingerprints are pinned too, and admission needs their identity.
+    this.trustedNodes = trustedNodes; // Map nodeId -> { publicKey, tlsFingerprint }
+    for (const entry of trustedNodes.values()) this.pins.add(entry.tlsFingerprint);
+    this.peerBook = new PeerBook({
+      trusted: new Map([...trustedNodes].map(([id, entry]) => [id, entry.publicKey])),
+      selfUrl,
+    });
+  }
+
+  // Dials a peer that is in the trust list. Admission happens only after the challenge-response succeeds.
+  async connectPeer(url) {
+    if (!this.nodeIdentity) throw new Error("connectPeer needs a node identity");
+    const { peerId } = await introduce({
+      url,
+      identity: this.nodeIdentity,
+      chainId: this.genesis.chainId,
+      pins: this.pins,
+      tlsIdentity: this.tlsIdentity,
+    });
+    this.peerBook.admit(url, peerId); // throws UNTRUSTED_NODE for identities outside the trust list
+    this.peers.add(this.peerBook.normalize(url));
+    return peerId;
   }
 
   // Automatic syncs (triggered by a message from the future) are rate limited per peer.

@@ -77,6 +77,10 @@ export class PeerBook {
     return key;
   }
 
+  normalize(url) {
+    return normalizeUrl(url);
+  }
+
   drop(url) {
     this.active.delete(normalizeUrl(url));
   }

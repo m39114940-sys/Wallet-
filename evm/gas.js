@@ -21,6 +21,17 @@ export function feeFor(gasUsed, gasLimit, policy = TESTNET_GAS_POLICY) {
   return gasUsed * policy.gasPriceBase;
 }
 
+// Sum of declared gas limits in one block must stay within the block cap.
+export function checkBlockGas(totalGasLimit, policy = TESTNET_GAS_POLICY) {
+  if (typeof totalGasLimit !== "bigint" || totalGasLimit < 0n) {
+    throw new EvmError("BAD_GAS_LIMIT", "block gas total must be a non-negative BigInt");
+  }
+  if (totalGasLimit > policy.blockGasLimit) {
+    throw new EvmError("BLOCK_GAS_TOO_HIGH", "declared gas exceeds the block cap");
+  }
+  return totalGasLimit;
+}
+
 // Maximum fee a sender must be able to pay before execution starts.
 export function maxFeeFor(gasLimit, policy = TESTNET_GAS_POLICY) {
   checkGasLimit(gasLimit, policy);

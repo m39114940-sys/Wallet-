@@ -5,7 +5,7 @@ import { EvmError } from "../evm/errors.js";
 import { BASE_PER_SNN, MIN_TRANSFER_BASE, EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "../evm/params.js";
 import { snnToBase, baseToSnn, assertTransferable } from "../evm/units.js";
 import { evmAddressFromPublicKey, isEvmAddress, evmLedgerKey } from "../evm/accounts.js";
-import { checkGasLimit, feeFor, maxFeeFor } from "../evm/gas.js";
+import { checkGasLimit, checkBlockGas, feeFor, maxFeeFor } from "../evm/gas.js";
 
 const G_X = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const G_Y = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
@@ -89,6 +89,17 @@ test("EVM ledger keys live in their own namespace", () => {
 test("gas limit above the per-transaction cap is refused", () => {
   assert.equal(checkGasLimit(TESTNET_GAS_POLICY.maxGasLimitPerTx), TESTNET_GAS_POLICY.maxGasLimitPerTx);
   expectEvmError(() => checkGasLimit(TESTNET_GAS_POLICY.maxGasLimitPerTx + 1n), "GAS_LIMIT_TOO_HIGH");
+});
+
+test("Testnet gas caps match the approved strict values and are ordered correctly", () => {
+  assert.equal(TESTNET_GAS_POLICY.maxGasLimitPerTx, 3_000_000n);
+  assert.equal(TESTNET_GAS_POLICY.blockGasLimit, 30_000_000n);
+  assert.ok(TESTNET_GAS_POLICY.blockGasLimit >= TESTNET_GAS_POLICY.maxGasLimitPerTx);
+});
+
+test("declared gas in one block cannot exceed the block cap", () => {
+  assert.equal(checkBlockGas(TESTNET_GAS_POLICY.blockGasLimit), TESTNET_GAS_POLICY.blockGasLimit);
+  expectEvmError(() => checkBlockGas(TESTNET_GAS_POLICY.blockGasLimit + 1n), "BLOCK_GAS_TOO_HIGH");
 });
 
 test("gas limit must be a positive BigInt", () => {

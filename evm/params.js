@@ -14,6 +14,6 @@ export const EVM_CHAIN_IDS = Object.freeze({
 // Gas policy for the new Testnet only. Not valid for Mainnet and not an economic decision.
 export const TESTNET_GAS_POLICY = Object.freeze({
   gasPriceBase: 1_000_000_000n, // base units per gas unit (Testnet only)
-  maxGasLimitPerTx: 30_000_000n, // hard cap per transaction
-  blockGasLimit: 30_000_000n, // hard cap per block
+  maxGasLimitPerTx: 3_000_000n, // hard cap per transaction (strict, as approved)
+  blockGasLimit: 30_000_000n, // hard cap per block; must stay >= maxGasLimitPerTx
 });

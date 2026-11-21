@@ -44,6 +44,12 @@ export function createTlsIdentity(commonName) {
   }
 }
 
+// Fingerprint of the client certificate on a TLS socket, or null for plain sockets and anonymous clients.
+export function peerFingerprintOf(socket) {
+  const raw = socket.getPeerCertificate?.().raw;
+  return raw ? fingerprintOfCertificate(new X509Certificate(raw)) : null;
+}
+
 // True only if the connected client presented a certificate whose fingerprint is pinned.
 export function isPinnedSocket(socket, pins) {
   const raw = socket.getPeerCertificate?.().raw;

@@ -15,6 +15,9 @@ import https from "node:https";
 import { peerRequest, isPinnedSocket, TLS_VERSION_OPTIONS } from "./tls.js";
 import { Handshake } from "./handshake.js";
 import { RULES_HYBRID, withWork } from "../chain/core.js";
+import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
+import { PeerGuard } from "./guard.js";
+import { peerFingerprintOf } from "./tls.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
@@ -375,10 +378,18 @@ export class ChainNode {
       if (page.length < MAX_PAGE) break;
       from += page.length;
     }
-    if (!Array.isArray(blocks) || blocks.length <= this.blocks.length) {
+    if (!Array.isArray(blocks) || blocks.length === 0) return { adopted: false, height: this.tip.height };
+    // Finality: a chain that rewrites a committed block is refused before any other check.
+    if (!keepsCommittedPrefix(this.blocks, blocks)) {
+      throw new ChainError("REORG_BELOW_COMMITTED", "السلسلة المعروضة تعيد كتابة كتل معتمدة عندنا.");
+    }
+    // Cheap refusal under Testnet rules: a candidate that is not longer cannot win, so it is not replayed.
+    if (this.genesis.rules !== RULES_HYBRID && blocks.length <= this.blocks.length) {
       return { adopted: false, height: this.tip.height };
     }
     const state = await replayChain(blocks, this.genesis);
+    // Preference is decided only after the whole candidate has been validated.
+    if (!decideAdoption(this.blocks, blocks, this.genesis).adopt) return { adopted: false, height: this.tip.height };
     this.blocks = blocks;
     this.state = state;
     for (const [key, ev] of this.evidence) {
@@ -447,7 +458,14 @@ function makeLimiter() {
 // tlsOptions: { key, cert } PEM. Without it the server is plain HTTP, which only tests should use.
 export function createHttpServer(node, tlsOptions = null) {
   const allow = makeLimiter();
+  const guard = node.guard ?? (node.guard = new PeerGuard());
   const handler = async (req, res) => {
+    const fingerprint = peerFingerprintOf(req.socket);
+    // A banned pinned peer gets no answer at all.
+    if (fingerprint !== null && guard.isBanned(fingerprint)) {
+      req.socket.destroy();
+      return;
+    }
     try {
       if (!allow(req.socket.remoteAddress ?? "unknown")) {
         return sendJson(res, 429, { error: "rate limited", code: "RATE_LIMITED" });
@@ -508,6 +526,7 @@ export function createHttpServer(node, tlsOptions = null) {
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {
       const known = err instanceof LedgerError || err instanceof ChainError;
+      if (known && fingerprint !== null) guard.recordBad(fingerprint, err.code);
       return sendJson(res, known ? 400 : 500, {
         error: known ? err.message : "internal error",
         code: known ? err.code : "INTERNAL",

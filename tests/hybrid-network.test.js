@@ -25,6 +25,15 @@ let alice;
 let bob;
 let pins;
 const procs = [];
+const childLogs = []; // per node: exit status and the last part of its output
+
+const tail = (s, n = 4000) => (s.length > n ? s.slice(-n) : s);
+
+function describeChildren() {
+  return childLogs
+    .map((l, i) => `node ${i + 1} exit=${l.exit ?? "running"}\n--- stderr\n${l.err}\n--- stdout\n${l.out}`)
+    .join("\n");
+}
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -50,7 +59,14 @@ before(async () => {
     const args = [CLI, "--port", String(ports[i]), "--data", join(dir, `n${i + 1}`), "--genesis", join(dir, "genesis.json"),
       "--validator-key", join(dir, `validator-${i + 1}.json`), "--round-ms", "1000"];
     for (const p of peers) args.push("--peer", p);
-    procs.push(spawn(process.execPath, args, { stdio: ["ignore", "ignore", "ignore"], env: { ...process.env, SNN_VALIDATOR_PASSPHRASE: PASS } }));
+    // Output is kept (last part only) so a failing run shows why a node stopped answering.
+    const log = { out: "", err: "", exit: null };
+    childLogs.push(log);
+    const child = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, SNN_VALIDATOR_PASSPHRASE: PASS } });
+    child.stdout.on("data", (d) => { log.out = tail(log.out + d); });
+    child.stderr.on("data", (d) => { log.err = tail(log.err + d); });
+    child.on("exit", (code, signal) => { log.exit = `code=${code} signal=${signal}`; });
+    procs.push(child);
   }
   globalThis.urls = urls;
   await new Promise((r) => setTimeout(r, 4000)); // let the nodes start listening
@@ -90,11 +106,11 @@ async function waitForHeight(target, deadline) {
 test("four hybrid nodes commit proof-of-work blocks and agree on them", { timeout: TIMEOUT_MS * 2 + 10_000 }, async () => {
   await submitEverywhere(0);
   let heights = await waitForHeight(1, Date.now() + TIMEOUT_MS);
-  assert.ok(heights.every((h) => h >= 1), `heights after block 1: ${heights}`);
+  assert.ok(heights.every((h) => h >= 1), `heights after block 1: ${heights}\n${describeChildren()}`);
 
   await submitEverywhere(1);
   heights = await waitForHeight(2, Date.now() + TIMEOUT_MS);
-  assert.ok(heights.every((h) => h >= 2), `heights after block 2: ${heights}`);
+  assert.ok(heights.every((h) => h >= 2), `heights after block 2: ${heights}\n${describeChildren()}`);
 
   for (const height of [1, 2]) {
     const hashes = [];

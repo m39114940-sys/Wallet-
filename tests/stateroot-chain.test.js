@@ -1,7 +1,6 @@
 // State root in block rules. Only chains created with stateRootV1: true carry a root. Other chains refuse blocks that carry one.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MerkleStateManager } from "@ethereumjs/statemanager";
 import { generateValidatorKey, DEFAULT_STAKE } from "../node/tools.js";
 import { TESTNET_FAUCET_UNITS } from "../js/ledger.js";
 import {
@@ -16,7 +15,7 @@ import {
   withWork,
 } from "../chain/core.js";
 import { EMPTY_EVM_ROOT } from "../chain/stateroot.js";
-import { createTestnetCommon } from "../evm/engine.js";
+import { EvmAccounts } from "../evm/state.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
 
 const T0 = 1_700_000_000;
@@ -59,10 +58,11 @@ test("genesis refuses stateRootV1 without hybrid-v1 rules", async () => {
   assert.throws(() => validateGenesis(config), (err) => err.code === "BAD_GENESIS");
 });
 
-test("the empty EVM root constant equals the root of an empty EVM state", async () => {
-  const stateManager = new MerkleStateManager({ common: createTestnetCommon() });
-  const root = await stateManager.getStateRoot();
-  assert.equal(`0x${Buffer.from(root).toString("hex")}`, EMPTY_EVM_ROOT);
+test("the empty EVM root constant is the root of an empty account set and moves with any account", async () => {
+  assert.match(EMPTY_EVM_ROOT, /^0x[0-9a-f]{64}$/);
+  assert.equal(new EvmAccounts().root(), EMPTY_EVM_ROOT);
+  const one = EvmAccounts.fromAllocations({ ["0x" + "11".repeat(20)]: "1" });
+  assert.notEqual(one.root(), EMPTY_EVM_ROOT);
 });
 
 test("a block with the correct state root is applied and the transfer is visible", async () => {

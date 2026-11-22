@@ -9,7 +9,11 @@ import { validateWork, mine, nextTarget, PowError } from "./pow.js";
 import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
 import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
-import { compositeStateRoot, EMPTY_EVM_ROOT } from "./stateroot.js";
+import { compositeStateRoot } from "./stateroot.js";
+import { EvmAccounts } from "../evm/state.js";
+import { applyTransferEntry } from "../evm/transfer.js";
+import { EVM_CHAIN_IDS } from "../evm/params.js";
+import { EvmError } from "../evm/errors.js";
 
 export const GENESIS_PREV_HASH = "0".repeat(64);
 export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
@@ -115,7 +119,7 @@ export async function verifyEvidence(evRaw, chainId, state) {
 // rules: optional. Absent means the current Testnet rules, and the key is then not written at all, so
 // existing Testnet genesis hashes do not change. 'hybrid-v1' adds the proof-of-work check (see docs/hybrid-consensus.md).
 // powTarget: hex target for 'hybrid-v1' blocks. Fixed for now; difficulty retargeting is not wired in yet.
-export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs, stateRootV1 }) {
+export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs, stateRootV1, evmChainId, evmAllocations }) {
   const config = {
     chainId,
     timestamp,
@@ -130,10 +134,15 @@ export function createGenesisConfig({ chainId, timestamp, allocations, validator
   if (powRetargetWindow !== undefined) config.powRetargetWindow = powRetargetWindow;
   if (powBlockTimeMs !== undefined) config.powBlockTimeMs = powBlockTimeMs;
   if (stateRootV1 !== undefined) config.stateRootV1 = stateRootV1;
+  if (evmChainId !== undefined) config.evmChainId = evmChainId;
+  if (evmAllocations !== undefined) config.evmAllocations = evmAllocations;
   return config;
 }
 
 export const RULES_HYBRID = "hybrid-v1";
+
+// Fields of one EVM transfer entry in a block. Nothing else is allowed, so the block hash cannot carry extra data.
+const EVM_ENTRY_FIELDS = ["gasLimit", "nonce", "r", "s", "to", "v", "value"];
 
 export function validateGenesis(config) {
   const bad = (msg) => new ChainError("BAD_GENESIS", msg);
@@ -158,6 +167,20 @@ export function validateGenesis(config) {
   if (config.stateRootV1 !== undefined) {
     if (config.stateRootV1 !== true || config.rules !== RULES_HYBRID) {
       throw bad("جذر الحالة يتطلب قواعد hybrid-v1 ويُفعَّل بالقيمة true فقط.");
+    }
+  }
+  const evmConfigured = config.evmChainId !== undefined || config.evmAllocations !== undefined;
+  if (evmConfigured && config.stateRootV1 !== true) {
+    throw bad("إعدادات EVM تتطلب جذر الحالة (stateRootV1) على سلسلة جديدة.");
+  }
+  if (config.evmChainId !== undefined && (!Number.isSafeInteger(config.evmChainId) || config.evmChainId <= 0)) {
+    throw bad("معرّف سلسلة EVM غير صالح.");
+  }
+  if (config.evmAllocations !== undefined) {
+    try {
+      EvmAccounts.fromAllocations(config.evmAllocations);
+    } catch (err) {
+      throw bad(`تخصيصات EVM غير صالحة: ${err.message}`);
     }
   }
   const seen = new Set();
@@ -197,7 +220,10 @@ export function genesisState(config) {
     ledger.credit(address, TESTNET_FAUCET_UNITS);
   }
   const stakes = new Map(config.validators.map((v) => [v.publicKey, BigInt(v.stake)]));
-  return { ledger, stakes, jailed: new Set() };
+  const state = { ledger, stakes, jailed: new Set() };
+  // EVM accounts exist only on chains with stateRootV1. Their genesis funding is separate from the SNN allocations.
+  if (config.stateRootV1 === true) state.evm = EvmAccounts.fromAllocations(config.evmAllocations ?? {});
+  return state;
 }
 
 // ---------- State and validator set ----------
@@ -207,6 +233,7 @@ export async function cloneState(state) {
     ledger: await Ledger.fromSnapshot(JSON.parse(JSON.stringify(state.ledger))),
     stakes: new Map(state.stakes),
     jailed: new Set(state.jailed),
+    ...(state.evm !== undefined ? { evm: state.evm.clone() } : {}),
   };
 }
 
@@ -238,15 +265,18 @@ export const blockHashOf = (block) =>
       evidenceRoot: block.evidenceRoot,
       ...(block.work !== undefined ? { work: block.work } : {}),
       ...(block.stateRoot !== undefined ? { stateRoot: block.stateRoot } : {}),
+      // The Merkle root covers only SNN transactions, so EVM entries must be hashed on their own.
+      ...(block.evmTxs !== undefined ? { evmTxs: block.evmTxs } : {}),
     }),
   );
 
 const evidenceRootOf = (evidence) => merkleRoot(evidence.map((e) => sha256Hex(canonicalJson(e))));
 
 // Builds an unsigned block. Evidence is sorted by key, so the block bytes do not depend on arrival order.
-export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], work }) {
+export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], work, evmTxs }) {
   const normalized = txs.map(normalizeTx);
   const sorted = evidence.map(normalizeEvidence).sort((a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1));
+  if (evmTxs !== undefined && !Array.isArray(evmTxs)) throw new ChainError("BAD_EVM_TX", "حقل معاملات EVM يجب أن يكون قائمة.");
   const block = {
     height,
     timestamp,
@@ -258,6 +288,7 @@ export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], wo
     certificate: null,
   };
   if (work !== undefined) block.work = work;
+  if (evmTxs !== undefined) block.evmTxs = evmTxs.map((entry) => ({ ...entry }));
   block.hash = blockHashOf(block);
   return block;
 }
@@ -368,7 +399,7 @@ export async function applyBlock(state, block, parent, config, chain = null) {
 // Other chains refuse blocks that carry one, so the current Testnet is unaffected.
 export function checkStateRoot(next, block, config) {
   if (config.stateRootV1 === true) {
-    if (block.stateRoot !== compositeStateRoot(next.ledger, EMPTY_EVM_ROOT)) {
+    if (block.stateRoot !== compositeStateRoot(next.ledger, next.evm.root())) {
       throw new ChainError("BAD_STATE_ROOT", "جذر الحالة لا يطابق الحالة الناتجة.");
     }
   } else if (block.stateRoot !== undefined) {
@@ -382,7 +413,7 @@ export async function attachStateRoot(state, block, parent, config, chain = null
   if (config.stateRootV1 !== true) return block;
   // Work is attached after this call, so the proof-of-work check is skipped here. applyBlock checks it later.
   const next = await applyBlockBody(state, block, parent, config, chain, false);
-  const out = { ...block, stateRoot: compositeStateRoot(next.ledger, EMPTY_EVM_ROOT) };
+  const out = { ...block, stateRoot: compositeStateRoot(next.ledger, next.evm.root()) };
   out.hash = blockHashOf(out);
   return out;
 }
@@ -434,6 +465,25 @@ async function applyBlockBody(state, block, parent, config, chain = null, requir
       await next.ledger.transfer(tx);
     } catch (err) {
       throw new ChainError("BAD_TX", `معاملة غير صالحة داخل الكتلة: ${err.message}`);
+    }
+  }
+
+  if (block.evmTxs !== undefined) {
+    if (config.stateRootV1 !== true) throw new ChainError("BAD_EVM_TX", "معاملات EVM غير مسموحة في هذه السلسلة.");
+    if (!Array.isArray(block.evmTxs)) throw new ChainError("BAD_EVM_TX", "حقل معاملات EVM يجب أن يكون قائمة.");
+    // Testnet default when the genesis names no EVM chain id. The id is part of every signature, so a transfer
+    // signed for another chain cannot be replayed here.
+    const evmChainId = config.evmChainId ?? Number(EVM_CHAIN_IDS.testnet);
+    for (const entry of block.evmTxs) {
+      if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== EVM_ENTRY_FIELDS.join()) {
+        throw new ChainError("BAD_EVM_TX", "حقول معاملة EVM غير مسموحة.");
+      }
+      try {
+        applyTransferEntry(next.evm, entry, evmChainId);
+      } catch (err) {
+        if (err instanceof EvmError) throw new ChainError("BAD_EVM_TX", `معاملة EVM غير صالحة داخل الكتلة: ${err.message}`);
+        throw err;
+      }
     }
   }
   return next;

@@ -2,12 +2,13 @@
 // Composite root = H(domain || H(ledger) || evmRoot). Each part is hashed on its own so either can be checked alone.
 // Transaction history is excluded from the ledger root: it is already committed by each block's merkleRoot.
 import { sha256Hex, canonicalJson } from "./crypto.js";
+import { EvmAccounts } from "../evm/state.js";
 
 export const LEDGER_ROOT_DOMAIN = "snn-ledger-root-v1";
 export const COMPOSITE_ROOT_DOMAIN = "snn-state-root-v1";
 const EVM_ROOT_PATTERN = /^0x[0-9a-f]{64}$/;
-// Root of an empty EVM state trie (Keccak-256 of the RLP empty string). Until EVM transactions exist, every block carries it.
-export const EMPTY_EVM_ROOT = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+// Root of an empty EVM account set. Computed by the same function blocks use, so it cannot drift from it.
+export const EMPTY_EVM_ROOT = new EvmAccounts().root();
 
 export function ledgerRoot(ledger) {
   const { balances, nonces } = ledger.toJSON();

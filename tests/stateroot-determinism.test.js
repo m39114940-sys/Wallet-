@@ -9,7 +9,7 @@ import { ChainNode } from "../node/node.js";
 import { generateValidatorKey, DEFAULT_STAKE } from "../node/tools.js";
 import { applyCommitted, attachStateRoot, buildBlock, createGenesisConfig, voteMessage, withWork } from "../chain/core.js";
 import { signText } from "../chain/crypto.js";
-import { compositeStateRoot, EMPTY_EVM_ROOT } from "../chain/stateroot.js";
+import { compositeStateRoot } from "../chain/stateroot.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
 
 const T0 = Date.now() - 60_000;
@@ -65,7 +65,7 @@ test("four independent nodes reach the same state root for the same certified bl
     const roots = [];
     for (const node of nodes) {
       const next = await applyCommitted(node.state, block, node.tip, genesis, node.blocks);
-      roots.push(compositeStateRoot(next.ledger, EMPTY_EVM_ROOT));
+      roots.push(compositeStateRoot(next.ledger, next.evm.root()));
     }
     for (const root of roots) assert.equal(root, block.stateRoot);
     assert.equal(new Set(roots).size, 1);

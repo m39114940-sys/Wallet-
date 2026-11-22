@@ -1,7 +1,8 @@
 // Ethereum-style JSON-RPC. It reads node.genesis, node.tip, node.state and node.evmMempool.
 // The only write is eth_sendRawTransaction, which adds a checked entry to the EVM mempool through node.addEvmEntry.
 // EVM methods answer only on chains with stateRootV1, so the current Testnet keeps its behaviour.
-// Receipts are derived from committed blocks. Not yet here: eth_call, typed (EIP-2718) transactions, contract creation, logs.
+// Receipts are derived from committed blocks. eth_call and eth_estimateGas cover plain transfers only.
+// Not yet here: contract calls and creation, logs, typed (EIP-2718) transactions.
 import { createLegacyTxFromRLP } from "@ethereumjs/tx";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "../evm/params.js";
@@ -63,9 +64,9 @@ const quantityOf = (raw) => {
   return BigInt(raw);
 };
 
-// Gas for a plain value transfer. Only transfers are estimated: no calldata and no contract creation.
-// With a sender given, the sender's confirmed balance must cover the value plus the fee, as the node would require.
-function estimateTransferGas(node, params) {
+// Checks a plain value transfer for eth_estimateGas and eth_call. Only transfers are accepted: no calldata and no
+// contract creation. With a sender given, the sender's confirmed balance must cover the value plus the fee.
+function checkPlainTransfer(node, params) {
   const call = params?.[0];
   if (call === null || typeof call !== "object" || Array.isArray(call)) throw new RpcParamError("transaction object expected");
   if (call.to === undefined) throw new RpcParamError("contract creation is not supported");
@@ -79,8 +80,13 @@ function estimateTransferGas(node, params) {
     const fee = INTRINSIC_GAS * TESTNET_GAS_POLICY.gasPriceBase;
     if (node.state.evm.get(from).balance < value + fee) throw new RpcTxError("insufficient funds for value plus fee");
   }
-  return toHex(INTRINSIC_GAS);
 }
+
+// Gas for a plain value transfer: always the intrinsic 21,000.
+const estimateTransferGas = (node, params) => {
+  checkPlainTransfer(node, params);
+  return toHex(INTRINSIC_GAS);
+};
 
 const RAW_HEX = /^0x([0-9a-fA-F]{2})+$/;
 
@@ -122,6 +128,15 @@ const METHODS = {
   eth_blockNumber: { needsEvm: true, run: (node) => toHex(node.tip.height) },
   eth_gasPrice: { needsEvm: true, run: () => toHex(TESTNET_GAS_POLICY.gasPriceBase) },
   eth_estimateGas: { needsEvm: true, run: (node, params) => estimateTransferGas(node, params) },
+  // Simulates a plain transfer: "0x" (no return data) when it would go through, a rejection with the reason otherwise.
+  eth_call: {
+    needsEvm: true,
+    run: (node, params) => {
+      if (params?.[1] !== undefined && params[1] !== "latest") throw new RpcParamError("only the latest block tag is supported");
+      checkPlainTransfer(node, params);
+      return "0x";
+    },
+  },
   eth_getTransactionReceipt: {
     needsEvm: true,
     run: (node, params) => {

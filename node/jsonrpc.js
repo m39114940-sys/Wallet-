@@ -1,12 +1,12 @@
 // Ethereum-style JSON-RPC. It reads node.genesis, node.tip, node.state and node.evmMempool.
 // The only write is eth_sendRawTransaction, which adds a checked entry to the EVM mempool through node.addEvmEntry.
 // EVM methods answer only on chains with stateRootV1, so the current Testnet keeps its behaviour.
-// Not yet here: receipts, eth_call, estimateGas, typed (EIP-2718) transactions, contract creation.
+// Not yet here: receipts, eth_call, typed (EIP-2718) transactions, contract creation, gas estimates for calldata.
 import { createLegacyTxFromRLP } from "@ethereumjs/tx";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "../evm/params.js";
 import { isEvmAddress } from "../evm/accounts.js";
-import { applyTransferEntry } from "../evm/transfer.js";
+import { applyTransferEntry, INTRINSIC_GAS } from "../evm/transfer.js";
 import { createTestnetCommon } from "../evm/engine.js";
 import { evmChainIdOf } from "../chain/core.js";
 
@@ -49,11 +49,37 @@ function evmView(node, params, index) {
 }
 
 // 0x followed by 40 hex digits. Letter case is ignored, so checksummed addresses are accepted.
-function addressParam(params) {
-  const raw = params?.[0];
+function addressOf(raw) {
   const address = typeof raw === "string" ? raw.toLowerCase() : "";
   if (!isEvmAddress(address)) throw new RpcParamError("address must be a 0x-prefixed 20-byte hex string");
   return address;
+}
+
+const addressParam = (params) => addressOf(params?.[0]);
+
+const HEX_QUANTITY = /^0x[0-9a-fA-F]+$/;
+const quantityOf = (raw) => {
+  if (typeof raw !== "string" || !HEX_QUANTITY.test(raw)) throw new RpcParamError("value must be a 0x-prefixed hex quantity");
+  return BigInt(raw);
+};
+
+// Gas for a plain value transfer. Only transfers are estimated: no calldata and no contract creation.
+// With a sender given, the sender's confirmed balance must cover the value plus the fee, as the node would require.
+function estimateTransferGas(node, params) {
+  const call = params?.[0];
+  if (call === null || typeof call !== "object" || Array.isArray(call)) throw new RpcParamError("transaction object expected");
+  if (call.to === undefined) throw new RpcParamError("contract creation is not supported");
+  addressOf(call.to);
+  if (call.data !== undefined && call.data !== "0x" && call.data !== "") {
+    throw new RpcParamError("only plain value transfers are supported");
+  }
+  const value = call.value === undefined ? 0n : quantityOf(call.value);
+  if (call.from !== undefined) {
+    const from = addressOf(call.from);
+    const fee = INTRINSIC_GAS * TESTNET_GAS_POLICY.gasPriceBase;
+    if (node.state.evm.get(from).balance < value + fee) throw new RpcTxError("insufficient funds for value plus fee");
+  }
+  return toHex(INTRINSIC_GAS);
 }
 
 const RAW_HEX = /^0x([0-9a-fA-F]{2})+$/;
@@ -95,6 +121,7 @@ const METHODS = {
   eth_chainId: { needsEvm: true, run: () => toHex(EVM_CHAIN_IDS.testnet) },
   eth_blockNumber: { needsEvm: true, run: (node) => toHex(node.tip.height) },
   eth_gasPrice: { needsEvm: true, run: () => toHex(TESTNET_GAS_POLICY.gasPriceBase) },
+  eth_estimateGas: { needsEvm: true, run: (node, params) => estimateTransferGas(node, params) },
   eth_getBalance: { needsEvm: true, run: (node, params) => toHex(evmView(node, params, 1).get(addressParam(params)).balance) },
   eth_getTransactionCount: { needsEvm: true, run: (node, params) => toHex(evmView(node, params, 1).get(addressParam(params)).nonce) },
   eth_sendRawTransaction: {

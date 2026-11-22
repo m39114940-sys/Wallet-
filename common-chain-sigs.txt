@@ -1,0 +1,26 @@
+node_modules/@ethereumjs/common/dist/esm/types.d.ts:48:export interface GenesisBlockConfig {
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-49-    timestamp?: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-50-    gasLimit: number | PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-51-    difficulty: number | PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-52-    nonce: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-53-    extraData: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-54-    baseFeePerGas?: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-55-    excessBlobGas?: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-56-    requestsHash?: PrefixedHexString;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-57-}
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-58-/** Block or timestamp at which a hardfork activates. */
+node_modules/@ethereumjs/common/dist/esm/types.d.ts:59:export interface HardforkTransitionConfig {
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-60-    name: Hardfork | string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-61-    block: number | null;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-62-    timestamp?: number | string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-63-    forkHash?: PrefixedHexString | null;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-64-}
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-65-/** ENR/bootstrap node entry for a chain config. */
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-66-export interface BootstrapNodeConfig {
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-67-    ip: string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-68-    port: number | string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-69-    network?: string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-70-    chainId?: number;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-71-    id: string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-72-    location: string;
+node_modules/@ethereumjs/common/dist/esm/types.d.ts-73-    comment: string;

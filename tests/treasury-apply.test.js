@@ -35,3 +35,23 @@ test("malformed instructions are refused", () => {
   assert.throws(() => applyWithdrawal(ledger, { treasuryAddress: TREASURY, instruction: { to: TO, units: 0n } }), TreasuryError);
   assert.throws(() => applyWithdrawal(ledger, { treasuryAddress: TREASURY, instruction: null }), TreasuryError);
 });
+
+test("a withdrawal id is executed once; a replay is refused and the balance is unchanged", () => {
+  const ledger = funded(1_000n);
+  applyWithdrawal(ledger, { treasuryAddress: TREASURY, instruction: { to: TO, units: 100n }, withdrawalId: 7 });
+  assert.equal(ledger.hasWithdrawal(7), true);
+  assert.throws(
+    () => applyWithdrawal(ledger, { treasuryAddress: TREASURY, instruction: { to: TO, units: 100n }, withdrawalId: 7 }),
+    { code: "WITHDRAWAL_REPLAY" },
+  );
+  assert.equal(ledger.balanceOf(TREASURY), 900n);
+  assert.equal(ledger.balanceOf(TO), 100n);
+});
+
+test("withdrawal ids must be positive safe integers", () => {
+  const ledger = funded(1_000n);
+  assert.throws(
+    () => applyWithdrawal(ledger, { treasuryAddress: TREASURY, instruction: { to: TO, units: 1n }, withdrawalId: 0 }),
+    { code: "INVALID_WITHDRAWAL" },
+  );
+});

@@ -60,7 +60,9 @@ const corrupt = (detail) => new LedgerError("LEDGER_CORRUPT", `سجل المحف
 function assertRecordShape(record, expectedHeight) {
   if (!isPlainObject(record)) throw corrupt("سجل غير صالح.");
   const keys = Object.keys(record).sort();
-  if (keys.join() !== [...RECORD_FIELDS].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
+  // Protocol moves may carry a treasury withdrawal id; no other record type does.
+  const allowed = record.type === "protocol" && Object.hasOwn(record, "withdrawalId") ? [...RECORD_FIELDS, "withdrawalId"] : RECORD_FIELDS;
+  if (keys.join() !== [...allowed].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
   if (record.height !== expectedHeight) throw corrupt("ترقيم المعاملات غير متسلسل.");
   if (!DIGITS_PATTERN.test(String(record.amount)) || String(record.amount) === "0") {
     throw corrupt("مبلغ المعاملة غير صالح.");
@@ -84,6 +86,9 @@ function assertRecordShape(record, expectedHeight) {
     }
     if (record.nonce !== null || record.publicKey !== null || record.signature !== null) {
       throw corrupt("حركة البروتوكول تحتوي على حقول غير مسموحة.");
+    }
+    if (record.withdrawalId !== undefined && (!Number.isSafeInteger(record.withdrawalId) || record.withdrawalId <= 0)) {
+      throw corrupt("رقم السحب في حركة البروتوكول غير صالح.");
     }
   } else if (record.type === "faucet") {
     if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
@@ -120,6 +125,7 @@ function canonicalState({ balances, nonces, transactions }) {
       tx.nonce ?? null,
       tx.publicKey ?? null,
       tx.signature ?? null,
+      tx.withdrawalId ?? null,
     ]),
   });
 }
@@ -129,6 +135,7 @@ export class Ledger {
   #nonces = new Map();
   #transactions = [];
   #faucetRecipients = new Set();
+  #withdrawals = new Set(); // treasury withdrawal ids already executed; a repeat is refused
   #sealed = false; // true after the first transfer or protocol move; genesis mints are refused from then on
 
   // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
@@ -161,7 +168,12 @@ export class Ledger {
         } else if (record.type === "issue") {
           replayed.issue(record.to, BigInt(record.amount));
         } else if (record.type === "protocol") {
-          replayed.protocolMove({ from: record.from, to: record.to, amount: BigInt(record.amount) });
+          replayed.protocolMove({
+            from: record.from,
+            to: record.to,
+            amount: BigInt(record.amount),
+            ...(record.withdrawalId !== undefined ? { withdrawalId: record.withdrawalId } : {}),
+          });
         } else {
           await replayed.transfer({
             from: record.from,
@@ -303,8 +315,12 @@ export class Ledger {
     return sum;
   }
 
-  protocolMove({ from, to, amount }) {
+  protocolMove({ from, to, amount, withdrawalId }) {
     if (!isValidAddress(from)) throw new LedgerError("INVALID_SENDER", "عنوان الحركة غير صالح.");
+    if (withdrawalId !== undefined) {
+      if (!Number.isSafeInteger(withdrawalId) || withdrawalId <= 0) throw new LedgerError("INVALID_WITHDRAWAL", "رقم السحب غير صالح.");
+      if (this.#withdrawals.has(withdrawalId)) throw new LedgerError("WITHDRAWAL_REPLAY", "هذا السحب نُفّذ بالفعل.");
+    }
     if (to !== null && !isValidAddress(to)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الحركة غير صالح.");
     if (typeof amount !== "bigint" || amount <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ الحركة يجب أن يكون أكبر من صفر.");
     const balance = this.balanceOf(from);
@@ -312,7 +328,21 @@ export class Ledger {
     this.#balances.set(from, balance - amount);
     if (to !== null) this.#balances.set(to, this.balanceOf(to) + amount);
     this.#sealed = true;
-    return this.#record({ type: "protocol", from, to, amount, nonce: null, publicKey: null, signature: null });
+    if (withdrawalId !== undefined) this.#withdrawals.add(withdrawalId);
+    return this.#record({
+      type: "protocol",
+      from,
+      to,
+      amount,
+      nonce: null,
+      publicKey: null,
+      signature: null,
+      ...(withdrawalId !== undefined ? { withdrawalId } : {}),
+    });
+  }
+
+  hasWithdrawal(withdrawalId) {
+    return this.#withdrawals.has(withdrawalId);
   }
 
   #record(tx) {

@@ -166,14 +166,14 @@ export class Treasury {
 // Applies an approved withdrawal to a ledger (js/ledger.js). The treasury's locked balance is
 // passed in by the caller, so a locked amount can never leave the treasury early.
 // The move is a protocol record from the treasury address to the recipient.
-export function applyWithdrawal(ledger, { treasuryAddress, lockedUnits = 0n, instruction }) {
+export function applyWithdrawal(ledger, { treasuryAddress, lockedUnits = 0n, instruction, withdrawalId }) {
   if (instruction === null || typeof instruction !== "object") fail("BAD_INSTRUCTION", "تعليمة السحب مطلوبة.");
   const { to, units } = instruction;
   if (typeof units !== "bigint" || units <= 0n) fail("BAD_INSTRUCTION", "المبلغ يجب أن يكون عدداً صحيحاً موجباً.");
   if (typeof lockedUnits !== "bigint" || lockedUnits < 0n) fail("BAD_INSTRUCTION", "قيمة الرصيد المقفل غير صالحة.");
   const spendable = ledger.balanceOf(treasuryAddress) - lockedUnits;
   if (spendable < units) fail("INSUFFICIENT_SPENDABLE", "الرصيد القابل للصرف في الخزينة غير كافٍ.");
-  return ledger.protocolMove({ from: treasuryAddress, to, amount: units });
+  return ledger.protocolMove({ from: treasuryAddress, to, amount: units, withdrawalId });
 }
 
 // Stateless check for a withdrawal bundle: the chain can call this without holding the proposal in memory.

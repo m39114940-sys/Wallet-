@@ -9,6 +9,7 @@ import { validateWork, mine, nextTarget, PowError } from "./pow.js";
 import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
 import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
+import { compositeStateRoot, EMPTY_EVM_ROOT } from "./stateroot.js";
 
 export const GENESIS_PREV_HASH = "0".repeat(64);
 export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
@@ -114,7 +115,7 @@ export async function verifyEvidence(evRaw, chainId, state) {
 // rules: optional. Absent means the current Testnet rules, and the key is then not written at all, so
 // existing Testnet genesis hashes do not change. 'hybrid-v1' adds the proof-of-work check (see docs/hybrid-consensus.md).
 // powTarget: hex target for 'hybrid-v1' blocks. Fixed for now; difficulty retargeting is not wired in yet.
-export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs }) {
+export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs, stateRootV1 }) {
   const config = {
     chainId,
     timestamp,
@@ -128,6 +129,7 @@ export function createGenesisConfig({ chainId, timestamp, allocations, validator
   if (powTarget !== undefined) config.powTarget = powTarget;
   if (powRetargetWindow !== undefined) config.powRetargetWindow = powRetargetWindow;
   if (powBlockTimeMs !== undefined) config.powBlockTimeMs = powBlockTimeMs;
+  if (stateRootV1 !== undefined) config.stateRootV1 = stateRootV1;
   return config;
 }
 
@@ -152,6 +154,11 @@ export function validateGenesis(config) {
     }
   } else if (config.powTarget !== undefined || config.powRetargetWindow !== undefined || config.powBlockTimeMs !== undefined) {
     throw bad("هدف إثبات العمل يُستخدم فقط مع قواعد hybrid-v1.");
+  }
+  if (config.stateRootV1 !== undefined) {
+    if (config.stateRootV1 !== true || config.rules !== RULES_HYBRID) {
+      throw bad("جذر الحالة يتطلب قواعد hybrid-v1 ويُفعَّل بالقيمة true فقط.");
+    }
   }
   const seen = new Set();
   for (const v of config.validators) {
@@ -230,6 +237,7 @@ export const blockHashOf = (block) =>
       merkleRoot: block.merkleRoot,
       evidenceRoot: block.evidenceRoot,
       ...(block.work !== undefined ? { work: block.work } : {}),
+      ...(block.stateRoot !== undefined ? { stateRoot: block.stateRoot } : {}),
     }),
   );
 
@@ -351,6 +359,34 @@ export async function verifyCertificate(chainId, parentState, block, maxShareBps
 // Validates one block against its parent and returns the state after it. Throws ChainError on any problem.
 // It never modifies `state`. It does not check the certificate: see applyCommitted for that.
 export async function applyBlock(state, block, parent, config, chain = null) {
+  const next = await applyBlockBody(state, block, parent, config, chain);
+  checkStateRoot(next, block, config);
+  return next;
+}
+
+// Chains with stateRootV1 require a root equal to the state reached after this block.
+// Other chains refuse blocks that carry one, so the current Testnet is unaffected.
+export function checkStateRoot(next, block, config) {
+  if (config.stateRootV1 === true) {
+    if (block.stateRoot !== compositeStateRoot(next.ledger, EMPTY_EVM_ROOT)) {
+      throw new ChainError("BAD_STATE_ROOT", "جذر الحالة لا يطابق الحالة الناتجة.");
+    }
+  } else if (block.stateRoot !== undefined) {
+    throw new ChainError("BAD_STATE_ROOT", "جذر الحالة غير مسموح في هذه السلسلة.");
+  }
+}
+
+// Producer side: applies the block, records the resulting state root, and recomputes the hash.
+// Call this before withWork, because work and certificates cover the hash.
+export async function attachStateRoot(state, block, parent, config, chain = null) {
+  if (config.stateRootV1 !== true) return block;
+  const next = await applyBlockBody(state, block, parent, config, chain);
+  const out = { ...block, stateRoot: compositeStateRoot(next.ledger, EMPTY_EVM_ROOT) };
+  out.hash = blockHashOf(out);
+  return out;
+}
+
+async function applyBlockBody(state, block, parent, config, chain = null) {
   if (block === null || typeof block !== "object" || !Array.isArray(block.txs) || !Array.isArray(block.evidence)) {
     throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
   }

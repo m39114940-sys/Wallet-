@@ -2,7 +2,7 @@
 // tampered ledger records, and malformed or hostile keystore files.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, MAX_TRANSACTIONS, parseAmount } from "../js/ledger.js";
+import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, parseAmount } from "../js/ledger.js";
 import { createKeystore, parseKeystoreFile, unlockKeystore, MAX_KEYSTORE_BYTES, MAX_ITERATIONS } from "../js/keystore.js";
 import { signTransfer, toHex, createAccount, importSigningKey } from "../js/signing.js";
 import { makeAccount, signedTransfer } from "./helpers.js";
@@ -242,7 +242,8 @@ test("a nonce edited in storage is detected", async () => {
 });
 
 test("a ledger exceeding the transaction limit is rejected without replay", async () => {
-  await expectCorrupt(Ledger.fromSnapshot({ balances: {}, nonces: {}, transactions: new Array(MAX_TRANSACTIONS + 1).fill({}) }));
+  // No record count limit: a long history is judged record by record, so a bogus record is still refused.
+  await expectCorrupt(Ledger.fromSnapshot({ balances: {}, nonces: {}, transactions: new Array(10_001).fill({}) }));
 });
 
 test("a snapshot of the wrong shape is rejected", async () => {

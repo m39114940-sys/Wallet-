@@ -8,7 +8,8 @@ import { createLegacyTx } from "@ethereumjs/tx";
 import { ChainNode } from "../node/node.js";
 import { handleRpc, RPC_ERRORS } from "../node/jsonrpc.js";
 import { generateValidatorKey, DEFAULT_STAKE } from "../node/tools.js";
-import { applyBlock, buildBlock, createGenesisConfig } from "../chain/core.js";
+import { applyBlock, buildBlock, createGenesisConfig, voteMessage } from "../chain/core.js";
+import { signText } from "../chain/crypto.js";
 import { receiptsOfBlock } from "../chain/receipts.js";
 import { createTestnetCommon } from "../evm/engine.js";
 import { BASE_PER_SNN, EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "../evm/params.js";
@@ -54,9 +55,10 @@ function rawOf(entry) {
   return "0x" + Buffer.from(tx.serialize()).toString("hex");
 }
 
-async function makeGenesis(stateRoot = true) {
+async function makeGenesis(stateRoot = true, keysOut = null) {
   const keys = [];
   for (let i = 0; i < 4; i++) keys.push(await generateValidatorKey());
+  if (keysOut !== null) keysOut.keys = keys;
   return createGenesisConfig({
     chainId: "snn-receipts",
     timestamp: Date.now() - 60_000,
@@ -74,11 +76,19 @@ async function makeGenesis(stateRoot = true) {
 const rpc = (node, method, params) => handleRpc(node, { jsonrpc: "2.0", id: 1, method, params });
 
 // Sends one raw transfer, mines and commits its block, and returns the hash the node reported.
-async function sendAndCommit(node, genesis, entry) {
+async function sendAndCommit(node, genesis, entry, keys) {
   const sent = rpc(node, "eth_sendRawTransaction", [rawOf(entry)]);
   const block = await node.assemble([]);
   const next = await applyBlock(node.state, block, node.tip, genesis, node.blocks);
-  await node.commitBlock(block, next);
+  const signatures = [];
+  for (let i = 0; i < 3; i++) {
+    signatures.push({
+      validator: keys[i].publicKey,
+      signature: await signText(keys[i].privateKeyDer, voteMessage(genesis.chainId, "precommit", block.height, 0, block.hash)),
+    });
+  }
+  const certified = { ...block, certificate: { round: 0, signatures } };
+  await node.commitBlock(certified, next);
   return sent.result;
 }
 
@@ -94,10 +104,11 @@ async function withDir(fn) {
 
 test("a committed transfer has a receipt that matches the hash the node reported", async () => {
   await withDir(async (dir) => {
-    const genesis = await makeGenesis();
+    const keysOut = {};
+    const genesis = await makeGenesis(true, keysOut);
     const node = new ChainNode({ dataDir: dir, genesis });
     await node.init();
-    const hash = await sendAndCommit(node, genesis, entryFor(0));
+    const hash = await sendAndCommit(node, genesis, entryFor(0), keysOut.keys);
     const receipt = rpc(node, "eth_getTransactionReceipt", [hash]).result;
     assert.equal(receipt.transactionHash, hash);
     assert.equal(receipt.status, "0x1");
@@ -152,17 +163,15 @@ test("two transfers in one block get consecutive indexes and cumulative gas", ()
   assert.equal(second.cumulativeGasUsed, "0x" + (2n * INTRINSIC_GAS).toString(16));
 });
 
-// Restart replay checks commit certificates, which this test does not produce (the consensus tests cover them).
-// So this test gives a fresh node the same blocks and checks that its index rebuilds to the same receipt.
-test("a fresh node holding the same blocks answers the same receipt", async () => {
+test("a restarted node answers the same receipt from its stored chain", async () => {
   await withDir(async (dir) => {
-    const genesis = await makeGenesis();
+    const keysOut = {};
+    const genesis = await makeGenesis(true, keysOut);
     const first = new ChainNode({ dataDir: dir, genesis });
     await first.init();
-    const hash = await sendAndCommit(first, genesis, entryFor(0));
-    const again = new ChainNode({ dataDir: join(dir, "fresh"), genesis });
+    const hash = await sendAndCommit(first, genesis, entryFor(0), keysOut.keys);
+    const again = new ChainNode({ dataDir: dir, genesis });
     await again.init();
-    again.blocks = first.blocks;
     const receipt = rpc(again, "eth_getTransactionReceipt", [hash]).result;
     assert.equal(receipt.transactionHash, hash);
     assert.equal(receipt.status, "0x1");

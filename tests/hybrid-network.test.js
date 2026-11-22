@@ -26,12 +26,14 @@ let bob;
 let pins;
 const procs = [];
 const childLogs = []; // per node: exit status and the last part of its output
+const statusErrors = []; // per node: the last error from a /status request, so a failed check says why
 
 const tail = (s, n = 4000) => (s.length > n ? s.slice(-n) : s);
+const describeError = (err) => `${err?.code ?? "no-code"}: ${err?.message ?? String(err)}`;
 
 function describeChildren() {
   return childLogs
-    .map((l, i) => `node ${i + 1} exit=${l.exit ?? "running"}\n--- stderr\n${l.err}\n--- stdout\n${l.out}`)
+    .map((l, i) => `node ${i + 1} exit=${l.exit ?? "running"} last-status-error=${statusErrors[i] ?? "none"}\n--- stderr\n${l.err}\n--- stdout\n${l.out}`)
     .join("\n");
 }
 
@@ -96,7 +98,16 @@ async function submitEverywhere(nonce) {
 async function waitForHeight(target, deadline) {
   let heights = [];
   while (Date.now() < deadline) {
-    heights = await Promise.all(globalThis.urls.map((u) => status(u).then((s) => s.height).catch(() => -1)));
+    heights = await Promise.all(
+      globalThis.urls.map((u, i) =>
+        status(u)
+          .then((s) => s.height)
+          .catch((err) => {
+            statusErrors[i] = describeError(err);
+            return -1;
+          }),
+      ),
+    );
     if (heights.every((h) => h >= target)) return heights;
     await new Promise((r) => setTimeout(r, 500));
   }

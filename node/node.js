@@ -29,6 +29,8 @@ import {
   buildBlock,
   checkEvmEntryShape,
   cloneState,
+  applyUserTx,
+  feeOf,
   evmChainIdOf,
   evmEntryId,
   evidenceKey,
@@ -229,6 +231,11 @@ export class ChainNode {
 
   // ---------- Transactions ----------
 
+  // Fee the next block will charge per transaction. Zero unless the genesis names economics.
+  nextFee() {
+    return feeOf(this.tip, this.genesis);
+  }
+
   async submitTx(raw) {
     const tx = normalizeTx(raw);
     const id = txId(tx);
@@ -237,7 +244,7 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
-    await trial.ledger.transfer(tx); // throws LedgerError with a specific code if invalid
+    await applyUserTx(trial, tx, this.genesis, this.nextFee()); // throws with a specific code if invalid
 
     this.mempool.set(id, tx);
     this.gossip("/tx", tx);
@@ -276,9 +283,10 @@ export class ChainNode {
   async assemble(evidence) {
     const trial = await cloneState(this.state);
     const included = [];
+    const fee = this.nextFee();
     for (const tx of this.mempool.values()) {
       try {
-        await trial.ledger.transfer(tx);
+        await applyUserTx(trial, tx, this.genesis, fee);
         included.push(tx);
       } catch {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
@@ -407,9 +415,10 @@ export class ChainNode {
   // Drops mempool entries that no longer apply after a block changed the state.
   async pruneMempool() {
     const trial = await cloneState(this.state);
+    const fee = this.nextFee();
     for (const [id, tx] of [...this.mempool]) {
       try {
-        await trial.ledger.transfer(tx);
+        await applyUserTx(trial, tx, this.genesis, fee);
       } catch {
         this.mempool.delete(id);
       }

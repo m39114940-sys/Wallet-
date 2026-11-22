@@ -1,8 +1,7 @@
 // Fee and issuance rules for SmartNode Network. Pure functions only.
 //
-// This module does not touch chain state, blocks, Genesis, Testnet, or Mainnet.
-// It is not called by chain/, node/, or js/. Wiring it into consensus is a separate
-// decision that needs its own approval.
+// This module is pure. chain/core.js calls it only on chains whose Genesis names `economics`
+// (new chains). Chains without that field never reach it, so the current Testnet is unaffected.
 //
 // No economic value is defined here. Every amount, tier, split and target must be
 // passed in explicitly, and missing or invalid values are rejected. Amounts are in

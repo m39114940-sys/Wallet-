@@ -142,7 +142,19 @@ export function createGenesisConfig({ chainId, timestamp, allocations, validator
 export const RULES_HYBRID = "hybrid-v1";
 
 // Fields of one EVM transfer entry in a block. Nothing else is allowed, so the block hash cannot carry extra data.
-const EVM_ENTRY_FIELDS = ["gasLimit", "nonce", "r", "s", "to", "v", "value"];
+export const EVM_ENTRY_FIELDS = ["gasLimit", "nonce", "r", "s", "to", "v", "value"];
+
+// Chain id used for EVM signatures on this chain. The Testnet value applies when the genesis names none.
+export const evmChainIdOf = (config) => config.evmChainId ?? Number(EVM_CHAIN_IDS.testnet);
+
+// Strict shape check for one EVM entry, shared by the block rules and the node's mempool.
+export function checkEvmEntryShape(entry) {
+  if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== EVM_ENTRY_FIELDS.join()) {
+    throw new ChainError("BAD_EVM_TX", "حقول معاملة EVM غير مسموحة.");
+  }
+}
+
+export const evmEntryId = (entry) => sha256Hex(canonicalJson(entry));
 
 export function validateGenesis(config) {
   const bad = (msg) => new ChainError("BAD_GENESIS", msg);
@@ -473,11 +485,9 @@ async function applyBlockBody(state, block, parent, config, chain = null, requir
     if (!Array.isArray(block.evmTxs)) throw new ChainError("BAD_EVM_TX", "حقل معاملات EVM يجب أن يكون قائمة.");
     // Testnet default when the genesis names no EVM chain id. The id is part of every signature, so a transfer
     // signed for another chain cannot be replayed here.
-    const evmChainId = config.evmChainId ?? Number(EVM_CHAIN_IDS.testnet);
+    const evmChainId = evmChainIdOf(config);
     for (const entry of block.evmTxs) {
-      if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== EVM_ENTRY_FIELDS.join()) {
-        throw new ChainError("BAD_EVM_TX", "حقول معاملة EVM غير مسموحة.");
-      }
+      checkEvmEntryShape(entry);
       try {
         applyTransferEntry(next.evm, entry, evmChainId);
       } catch (err) {

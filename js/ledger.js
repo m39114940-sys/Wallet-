@@ -10,7 +10,6 @@ import { verifyTransferSignature } from "./signing.js";
 export const UNITS_PER_SNN = 1_000_000n;
 export const TESTNET_FAUCET_UNITS = 100n * UNITS_PER_SNN;
 export const ADDRESS_PATTERN = /^snn1[0-9a-f]{40}$/;
-export const MAX_TRANSACTIONS = 10_000;
 
 const DIGITS_PATTERN = /^(0|[1-9][0-9]{0,17})$/; // up to 18 digits, so a stored amount can never be absurdly large
 const PUBLIC_KEY_HEX = /^[0-9a-f]{64}$/;
@@ -136,30 +135,14 @@ export class Ledger {
   #transactions = [];
   #faucetRecipients = new Set();
   #withdrawals = new Set(); // treasury withdrawal ids already executed; a repeat is refused
+  #log = null; // optional append-only log that mirrors every record
   #sealed = false; // true after the first transfer or protocol move; genesis mints are refused from then on
 
-  // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
-  // Throws LEDGER_CORRUPT if the stored state cannot be reproduced exactly.
-  static async fromSnapshot(snapshot) {
-    if (!isPlainObject(snapshot) || !Array.isArray(snapshot.transactions)) {
-      throw corrupt("شكل السجل غير صالح.");
-    }
-    if (snapshot.transactions.length > MAX_TRANSACTIONS) {
-      throw corrupt("عدد المعاملات يتجاوز الحد المسموح.");
-    }
-    if (!isPlainObject(snapshot.balances) || !isPlainObject(snapshot.nonces)) {
-      throw corrupt("الأرصدة أو الأرقام التسلسلية غير صالحة.");
-    }
-    for (const [address, units] of Object.entries(snapshot.balances)) {
-      if (!isValidAddress(address) || !DIGITS_PATTERN.test(String(units))) throw corrupt("رصيد غير صالح.");
-    }
-    for (const [address, n] of Object.entries(snapshot.nonces)) {
-      if (!isValidAddress(address) || !Number.isSafeInteger(n) || n < 0) throw corrupt("رقم تسلسلي غير صالح.");
-    }
-
+  // Replays records from scratch, verifying each signature, nonce and record shape.
+  static async #replay(transactions) {
     const replayed = new Ledger();
     try {
-      for (const [index, record] of snapshot.transactions.entries()) {
+      for (const [index, record] of transactions.entries()) {
         assertRecordShape(record, index + 1);
         if (record.type === "faucet") {
           replayed.credit(record.to, BigInt(record.amount));
@@ -190,6 +173,44 @@ export class Ledger {
       throw corrupt(err instanceof LedgerError ? err.message : "فشل التحقق من المعاملات.");
     }
 
+    return replayed;
+  }
+
+  // Rebuilds the ledger from its append-only log, then keeps appending to that log.
+  static async fromLog(log) {
+    const transactions = [];
+    for (let i = 1; i <= log.length; i++) transactions.push(log.get(i));
+    const replayed = await Ledger.#replay(transactions);
+    replayed.attachLog(log);
+    return replayed;
+  }
+
+  // Mirrors every new record to the log before the caller returns. A failed write must discard this ledger.
+  attachLog(log) {
+    if (this.#log !== null) throw new LedgerError("LOG_ALREADY_ATTACHED", "السجل مرتبط بالفعل بسجل آخر.");
+    if (log.length !== this.#transactions.length) {
+      throw new LedgerError("LOG_MISMATCH", "طول السجل المحفوظ لا يطابق الدفتر.");
+    }
+    this.#log = log;
+  }
+
+  // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
+  // Throws LEDGER_CORRUPT if the stored state cannot be reproduced exactly.
+  static async fromSnapshot(snapshot) {
+    if (!isPlainObject(snapshot) || !Array.isArray(snapshot.transactions)) {
+      throw corrupt("شكل السجل غير صالح.");
+    }
+    if (!isPlainObject(snapshot.balances) || !isPlainObject(snapshot.nonces)) {
+      throw corrupt("الأرصدة أو الأرقام التسلسلية غير صالحة.");
+    }
+    for (const [address, units] of Object.entries(snapshot.balances)) {
+      if (!isValidAddress(address) || !DIGITS_PATTERN.test(String(units))) throw corrupt("رصيد غير صالح.");
+    }
+    for (const [address, n] of Object.entries(snapshot.nonces)) {
+      if (!isValidAddress(address) || !Number.isSafeInteger(n) || n < 0) throw corrupt("رقم تسلسلي غير صالح.");
+    }
+
+    const replayed = await Ledger.#replay(snapshot.transactions);
     if (canonicalState(replayed.toJSON()) !== canonicalState(snapshot)) {
       throw corrupt("الأرصدة لا تطابق المعاملات المسجلة.");
     }
@@ -347,6 +368,8 @@ export class Ledger {
 
   #record(tx) {
     const entry = { height: this.#transactions.length + 1, ...tx };
+    // The log stores plain JSON: amounts go down as decimal strings, as they are in snapshots.
+    if (this.#log !== null) this.#log.append({ ...entry, amount: String(entry.amount) });
     this.#transactions.push(entry);
     return { ...entry };
   }

@@ -50,7 +50,7 @@ What the engine tests cover:
 1. **State root in consensus block rules (partly done, branch `feature/evm-state-root`):** chains with `stateRootV1: true` (valid only with `hybrid-v1`) now require each block to carry a `stateRoot` equal to the composite of the ledger root and the EVM root. Other chains refuse blocks that carry one. The root is in the block hash only when present. Still missing: node producers do not call `attachStateRoot` yet, and the EVM root is the empty-state constant because EVM transactions are not in blocks yet.
 2. **Multi-node determinism:** the test compares two in-process state managers. It does not run several validator nodes over the network and compare roots.
 3. **Receipts and logs:** logs are returned in memory but are not stored in blocks or receipts.
-4. **Chain ID exact check:** chainid.network was only partially scanned for 20261121 and 20261122. A full check is still needed.
+4. **Chain ID check (done against ethereum-lists, exact):** a full search of the 2,897 chain entries in ethereum-lists (commit 75bdee7) found no entry with Chain ID 20261121 or 20261122. The chainid.network source was only partially scanned earlier; ethereum-lists is the exact list the owner asked to check, so this item is closed unless the owner requires the chainid.network site too.
 5. **Hardfork schedule:** all forks are set at block 0. This is a chosen simplification. The owner should confirm it.
 6. **Commit trailer:** some commits carry `Co-authored-by: Copilot`. They were not rewritten.
 
@@ -60,3 +60,4 @@ What the engine tests cover:
 - Confirm that the reference declaration files can be removed.
 - Decide whether to rewrite commit trailers that contain the Copilot line.
 - Approve starting the block-rule integration (item 1) before Phase D.
+- Receipts and logs (item 3): proposed to defer them to Phase D, because receipts are exposed through the Ethereum JSON-RPC layer that Phase D builds. Owner to confirm, or require them inside Phase C blocks now.

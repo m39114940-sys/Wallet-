@@ -242,7 +242,12 @@ export class ChainNode {
   }
 
   // Signed EVM transfers. Accepted only on stateRootV1 chains, and checked against the confirmed EVM state first.
+  // Synchronous: every check is in memory, and the JSON-RPC layer answers in the same call.
   async submitEvmTx(raw) {
+    return this.addEvmEntry(raw);
+  }
+
+  addEvmEntry(raw) {
     if (this.genesis.stateRootV1 !== true) throw new ChainError("EVM_DISABLED", "معاملات EVM غير مفعّلة على هذه السلسلة.");
     checkEvmEntryShape(raw);
     const entry = { ...raw };

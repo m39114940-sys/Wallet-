@@ -39,8 +39,13 @@ test("web3_clientVersion works on any chain", () => {
 });
 
 test("unknown methods return method-not-found", () => {
-  const res = handleRpc(evmNode(), { jsonrpc: "2.0", id: 7, method: "eth_sendRawTransaction" });
+  const res = handleRpc(evmNode(), { jsonrpc: "2.0", id: 7, method: "eth_notAMethod" });
   assert.equal(res.error.code, RPC_ERRORS.METHOD_NOT_FOUND);
+});
+
+test("eth_sendRawTransaction without a raw transaction is invalid params", () => {
+  const res = handleRpc(evmNode(), { jsonrpc: "2.0", id: 7, method: "eth_sendRawTransaction" });
+  assert.equal(res.error.code, RPC_ERRORS.INVALID_PARAMS);
 });
 
 test("prototype keys are not treated as methods", () => {

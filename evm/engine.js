@@ -5,12 +5,12 @@ import { createEVM } from "@ethereumjs/evm";
 import { Address } from "@ethereumjs/util";
 import { EvmError } from "./errors.js";
 import { testnetChainConfig, TESTNET_HARDFORK } from "./chain.js";
-import { TESTNET_GAS_POLICY } from "./params.js";
+import { EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "./params.js";
 import { checkGasLimit, feeFor } from "./gas.js";
 import { isEvmAddress } from "./accounts.js";
 
-export function createTestnetCommon() {
-  return new Common({ chain: testnetChainConfig(), hardfork: TESTNET_HARDFORK });
+export function createTestnetCommon(chainId = EVM_CHAIN_IDS.testnet) {
+  return new Common({ chain: testnetChainConfig(chainId), hardfork: TESTNET_HARDFORK });
 }
 
 export async function createTestnetEvm(stateManager) {

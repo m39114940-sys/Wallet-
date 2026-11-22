@@ -26,10 +26,11 @@ const FORKS_UP_TO_SHANGHAI = [
   "shanghai",
 ];
 
-export function testnetChainConfig() {
+// chainId defaults to the approved Testnet ID. The parameter exists so tests can check chain separation.
+export function testnetChainConfig(chainId = EVM_CHAIN_IDS.testnet) {
   return {
     name: "snn-testnet",
-    chainId: Number(EVM_CHAIN_IDS.testnet),
+    chainId: Number(chainId),
     defaultHardfork: TESTNET_HARDFORK,
     comment: "SmartNode Network EVM Testnet (new chain). Prototype, not for real funds.",
     genesis: {

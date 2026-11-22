@@ -32,8 +32,11 @@ Branch: `feature/evm-compat-design` at `f3660ce`.
 
 Results reported by the owner from Codespace:
 
-- `npm test` (full suite, including the new EVM tests): **205 passed, 0 failed, 1 skipped**.
+- `npm test` on `feature/evm-compat-design` (before the state-root work): **205 passed, 0 failed, 1 skipped**.
+- `npm test` on `feature/evm-state-root` (exit 0, full log): **217 passed, 0 failed, 1 skipped**.
 - `node --test tests/evm-engine.test.js`: **5 passed, 0 failed**.
+- `node --test tests/stateroot.test.js`: **5 passed, 0 failed**. `node --test tests/stateroot-chain.test.js`: **7 passed, 0 failed**.
+- `node --test tests/hybrid-network.test.js`: **1 passed**. An earlier full run was killed by the environment (exit 143) and then succeeded on rerun.
 
 What the engine tests cover:
 - Chain config uses Chain ID 20261122 and hardfork `shanghai`.
@@ -44,7 +47,7 @@ What the engine tests cover:
 
 ## Not done (blocks acceptance of Phase C)
 
-1. **State root in consensus block rules:** `stateRootHex` exists, but the block validator in `chain/` does not yet check or store it. The owner's approval requires it to be enforced in new-chain block rules.
+1. **State root in consensus block rules (partly done, branch `feature/evm-state-root`):** chains with `stateRootV1: true` (valid only with `hybrid-v1`) now require each block to carry a `stateRoot` equal to the composite of the ledger root and the EVM root. Other chains refuse blocks that carry one. The root is in the block hash only when present. Still missing: node producers do not call `attachStateRoot` yet, and the EVM root is the empty-state constant because EVM transactions are not in blocks yet.
 2. **Multi-node determinism:** the test compares two in-process state managers. It does not run several validator nodes over the network and compare roots.
 3. **Receipts and logs:** logs are returned in memory but are not stored in blocks or receipts.
 4. **Chain ID exact check:** chainid.network was only partially scanned for 20261121 and 20261122. A full check is still needed.

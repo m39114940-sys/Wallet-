@@ -18,12 +18,14 @@ import { RULES_HYBRID, withWork } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
 import { peerFingerprintOf } from "./tls.js";
+import { handleRpc } from "./jsonrpc.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
   applyCommitted,
+  attachStateRoot,
   buildBlock,
   cloneState,
   evidenceKey,
@@ -256,8 +258,12 @@ export class ChainNode {
       txs: included,
       evidence,
     });
+    // Chains with stateRootV1 record the resulting state root before work is mined, since work covers the hash.
+    const sealed = this.genesis.stateRootV1 === true
+      ? await attachStateRoot(this.state, block, this.tip, this.genesis, this.blocks)
+      : block;
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
-    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis, this.tip, this.blocks) : block;
+    return this.genesis.rules === RULES_HYBRID ? withWork(sealed, this.genesis, this.tip, this.blocks) : sealed;
   }
 
   // ---------- Evidence ----------
@@ -501,6 +507,10 @@ export function createHttpServer(node, tlsOptions = null) {
       }
       if (req.method === "GET" && pathname === "/balance") {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
+      }
+      if (req.method === "POST" && pathname === "/rpc") {
+        const body = await readJson(req);
+        return sendJson(res, 200, handleRpc(node, body));
       }
       if (req.method === "POST" && pathname === "/tx") {
         const body = await readJson(req);

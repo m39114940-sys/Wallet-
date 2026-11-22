@@ -224,9 +224,15 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   assert.equal(foreignSync.body.code, "PEER_NOT_ALLOWED");
 
   // 8. A flood from one address is throttled, and the node recovers once the bucket refills.
-  const flood = await Promise.all(
-    Array.from({ length: 600 }, () => get(v1, "/status").then((r) => r.status)),
-  );
-  assert.ok(flood.includes(429), "a burst above the limit is refused");
+  // The bucket holds 400 tokens and refills at 200 per second, so the outcome depends on timing.
+  // Send batches until the limiter refuses, with a fixed upper bound, instead of relying on one burst.
+  let refused = false;
+  for (let batch = 0; batch < 40 && !refused; batch++) {
+    const statuses = await Promise.all(
+      Array.from({ length: 50 }, () => get(v1, "/status").then((r) => r.status)),
+    );
+    refused = statuses.includes(429);
+  }
+  assert.ok(refused, "a flood above the limit is refused");
   await waitFor(async () => (await get(v1, "/status")).status === 200, "rate limit recovers", 10_000);
 });

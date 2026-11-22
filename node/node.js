@@ -43,6 +43,7 @@ import {
 } from "../chain/core.js";
 import { Consensus } from "../chain/consensus.js";
 import { applyTransferEntry } from "../evm/transfer.js";
+import { receiptsOfBlock } from "../chain/receipts.js";
 import { EvmError } from "../evm/errors.js";
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -76,6 +77,8 @@ export class ChainNode {
     this.state = null;
     this.mempool = new Map();
     this.evmMempool = new Map(); // signed EVM transfers waiting for a block; only on stateRootV1 chains
+    this.evmReceipts = new Map(); // transaction hash -> receipt, derived from the blocks (see syncReceiptIndex)
+    this.receiptIndex = { height: -1, hash: null }; // last block indexed
     this.evidence = new Map(); // evidenceKey -> verified evidence, waiting for a block
     this.queue = Promise.resolve();
     this.consensus = new Consensus({ node: this, keys: validator, roundMs });
@@ -297,6 +300,29 @@ export class ChainNode {
       : block;
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
     return this.genesis.rules === RULES_HYBRID ? withWork(sealed, this.genesis, this.tip, this.blocks) : sealed;
+  }
+
+  // Receipt for an EVM transaction hash that is in a committed block, or null.
+  evmReceipt(hash) {
+    this.syncReceiptIndex();
+    return this.evmReceipts.get(hash) ?? null;
+  }
+
+  // The index follows the chain: new blocks are added, and it is rebuilt when a block it indexed is no longer on the chain.
+  syncReceiptIndex() {
+    let { height, hash } = this.receiptIndex;
+    if (height >= 0 && (height >= this.blocks.length || this.blocks[height].hash !== hash)) {
+      this.evmReceipts = new Map();
+      height = -1;
+      hash = null;
+    }
+    for (let h = height + 1; h < this.blocks.length; h++) {
+      const block = this.blocks[h];
+      for (const { hash: txHash, receipt } of receiptsOfBlock(block)) this.evmReceipts.set(txHash, receipt);
+      height = h;
+      hash = block.hash;
+    }
+    this.receiptIndex = { height, hash };
   }
 
   // EVM entries that apply in order on the confirmed EVM state. Invalid ones are skipped, as SNN transactions are.

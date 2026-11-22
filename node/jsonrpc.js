@@ -1,7 +1,7 @@
 // Ethereum-style JSON-RPC. It reads node.genesis, node.tip, node.state and node.evmMempool.
 // The only write is eth_sendRawTransaction, which adds a checked entry to the EVM mempool through node.addEvmEntry.
 // EVM methods answer only on chains with stateRootV1, so the current Testnet keeps its behaviour.
-// Not yet here: receipts, eth_call, typed (EIP-2718) transactions, contract creation, gas estimates for calldata.
+// Receipts are derived from committed blocks. Not yet here: eth_call, typed (EIP-2718) transactions, contract creation, logs.
 import { createLegacyTxFromRLP } from "@ethereumjs/tx";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { EVM_CHAIN_IDS, TESTNET_GAS_POLICY } from "../evm/params.js";
@@ -122,6 +122,16 @@ const METHODS = {
   eth_blockNumber: { needsEvm: true, run: (node) => toHex(node.tip.height) },
   eth_gasPrice: { needsEvm: true, run: () => toHex(TESTNET_GAS_POLICY.gasPriceBase) },
   eth_estimateGas: { needsEvm: true, run: (node, params) => estimateTransferGas(node, params) },
+  eth_getTransactionReceipt: {
+    needsEvm: true,
+    run: (node, params) => {
+      const hash = params?.[0];
+      if (typeof hash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+        throw new RpcParamError("transaction hash must be 32 bytes of 0x-prefixed hex");
+      }
+      return node.evmReceipt(hash.toLowerCase());
+    },
+  },
   eth_getBalance: { needsEvm: true, run: (node, params) => toHex(evmView(node, params, 1).get(addressParam(params)).balance) },
   eth_getTransactionCount: { needsEvm: true, run: (node, params) => toHex(evmView(node, params, 1).get(addressParam(params)).nonce) },
   eth_sendRawTransaction: {

@@ -32,6 +32,10 @@ async function setup({ economics = true, feeOverrides = {} } = {}) {
     blockCapacity: "10",
     blocksPerPeriod: "4",
     securityTargetPerPeriod: "4000000",
+    emissionBlocks: "2",          // fixture: blocks 1 and 2 are emission era, block 3 onward is post-emission
+    periodsPerYear: "4",
+    postTargetPerPeriod: "1000000",
+    postCapBps: "100",            // 1% of circulating supply per year
     feeAddress: fee.address,
     treasuryAddress: treasury.address,
     poolAddress: pool.address,
@@ -172,3 +176,30 @@ test("economicsParamsOf converts genesis strings to integers", async () => {
   assert.equal(p.feeSplitBps.burn, 500n);
   assert.equal(p.issuancePool, POOL);
 });
+
+test("after emission, the shortfall is minted up to the cap on circulating supply, paid to the parent's signers", async () => {
+  const s = await setup();
+  const pay = await signedTransfer(s.alice, s.bob.address, "3", 0);
+  const block1 = await sealed(s.state0, buildBlock({ height: 1, timestamp: T0 + 10, prevHash: s.genesis.hash, txs: [pay] }), s.genesis, s.config);
+  const certified1 = await certify(block1, s.keys, [0, 1, 2]);
+  const state1 = await applyBlock(s.state0, certified1, s.genesis, s.config);
+  const block2 = await sealed(state1, buildBlock({ height: 2, timestamp: T0 + 20, prevHash: certified1.hash, txs: [] }), certified1, s.config);
+  const certified2 = await certify(block2, s.keys, [0, 1, 2]);
+  const state2 = await applyBlock(state1, block2, certified1, s.config);
+  const block3 = await sealed(state2, buildBlock({ height: 3, timestamp: T0 + 30, prevHash: certified2.hash, txs: [] }), certified2, s.config);
+  const state3 = await applyBlock(state2, block3, certified2, s.config);
+
+  // Block 3 of a 4-block period: target 250,000 units, no fee share, so the shortfall is the full target.
+  // Cap: circulating (all balances except pool, treasury, fee) x 1% / (periods per year x blocks per period).
+  const circulating = state2.ledger.totalBalance([s.pool.address, s.treasury.address, s.fee.address]);
+  const cap = (circulating * 100n) / (10_000n * 16n);
+  const expected = cap < 250_000n ? cap : 250_000n;
+  assert.equal(state3.ledger.totalBalance([]) - state2.ledger.totalBalance([]), expected);  // minted, nothing else
+  assert.equal(state3.ledger.balanceOf(s.pool.address), state2.ledger.balanceOf(s.pool.address)); // pool untouched
+
+  const signers = [s.keys[0], s.keys[1], s.keys[2]].map((k) => k.publicKey);
+  const addrs = await Promise.all(signers.map((k) => addressFromPublicKey(fromHex(k))));
+  const received = addrs.reduce((sum, a) => sum + (state3.ledger.balanceOf(a) - state2.ledger.balanceOf(a)), 0n);
+  assert.equal(received, expected);
+});
+

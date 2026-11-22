@@ -71,6 +71,12 @@ function assertRecordShape(record, expectedHeight) {
       throw corrupt("سجل التأسيس يحتوي على حقول غير مسموحة.");
     }
     if (!isValidAddress(record.to)) throw corrupt("عنوان التأسيس غير صالح.");
+  } else if (record.type === "issue") {
+    // Post-emission issuance: new units minted by protocol rules. The cap is enforced by the chain, not here.
+    if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("سجل الإصدار يحتوي على حقول غير مسموحة.");
+    }
+    if (!isValidAddress(record.to)) throw corrupt("عنوان الإصدار غير صالح.");
   } else if (record.type === "protocol") {
     // Protocol move: fee, reward, issuance or burn. Never signed. `to` null means burned.
     if (!isValidAddress(record.from) || (record.to !== null && !isValidAddress(record.to))) {
@@ -152,6 +158,8 @@ export class Ledger {
           replayed.credit(record.to, BigInt(record.amount));
         } else if (record.type === "genesis") {
           replayed.genesisMint(record.to, BigInt(record.amount));
+        } else if (record.type === "issue") {
+          replayed.issue(record.to, BigInt(record.amount));
         } else if (record.type === "protocol") {
           replayed.protocolMove({ from: record.from, to: record.to, amount: BigInt(record.amount) });
         } else {
@@ -276,6 +284,25 @@ export class Ledger {
 
   // Protocol move between accounts without a signature: fee, reward, issuance, or burn (to === null).
   // Checks funds exactly like a transfer. Never creates units.
+  // Post-emission issuance. Only the chain calls this, after checking the cap and the target. Never exposed to users.
+  issue(address, units) {
+    if (!isValidAddress(address)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الإصدار غير صالح.");
+    if (typeof units !== "bigint" || units <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ الإصدار يجب أن يكون أكبر من صفر.");
+    this.#balances.set(address, this.balanceOf(address) + units);
+    this.#sealed = true;
+    return this.#record({ type: "issue", from: null, to: address, amount: units, nonce: null, publicKey: null, signature: null });
+  }
+
+  // Sum of balances, leaving out the listed accounts. Used for the circulating base of the issuance cap.
+  totalBalance(exclude = []) {
+    const skip = new Set(exclude);
+    let sum = 0n;
+    for (const [address, units] of this.#balances) {
+      if (!skip.has(address)) sum += units;
+    }
+    return sum;
+  }
+
   protocolMove({ from, to, amount }) {
     if (!isValidAddress(from)) throw new LedgerError("INVALID_SENDER", "عنوان الحركة غير صالح.");
     if (to !== null && !isValidAddress(to)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الحركة غير صالح.");

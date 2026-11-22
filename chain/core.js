@@ -275,6 +275,13 @@ function validateEconomics(e, bad) {
   if (BigInt(digits(e.blockCapacity, "سعة الكتلة")) === 0n) throw bad("سعة الكتلة يجب أن تكون أكبر من صفر.");
   if (BigInt(digits(e.blocksPerPeriod, "عدد الكتل لكل فترة")) === 0n) throw bad("عدد الكتل لكل فترة يجب أن يكون أكبر من صفر.");
   digits(e.securityTargetPerPeriod, "هدف الإصدار لكل فترة");
+  // Post-emission rules: after `emissionBlocks` the reward target continues, funded by fees first, then by capped issuance.
+  digits(e.emissionBlocks, "عدد كتل الإصدار");
+  if (BigInt(digits(e.periodsPerYear, "عدد الفترات في السنة")) === 0n) throw bad("عدد الفترات في السنة يجب أن يكون أكبر من صفر.");
+  digits(e.postTargetPerPeriod, "هدف ما بعد الإصدار لكل فترة");
+  if (BigInt(digits(e.postCapBps, "سقف الإصدار بعد الإصدار الأولي")) > 10_000n) {
+    throw bad("سقف الإصدار بعد الإصدار الأولي يجب ألا يتجاوز 10000 نقطة أساس.");
+  }
   for (const name of ["feeAddress", "treasuryAddress", "poolAddress"]) {
     if (!isValidAddress(e[name])) throw bad(`عنوان ${name} غير صالح.`);
   }
@@ -342,14 +349,28 @@ async function settleEconomics(next, block, parent, state, config, fee) {
     const feesTotal = fee * BigInt(block.txs.length);
     const split = splitFee(feesTotal, params.feeSplitBps);
     // Validator share, then issuance. Both go to the parent's certificate signers. Without signers, the treasury gets them.
+    const post = BigInt(block.height) > BigInt(e.emissionBlocks);
+    const perPeriod = BigInt(post ? e.postTargetPerPeriod : e.securityTargetPerPeriod);
     const i = BigInt(block.height) % BigInt(e.blocksPerPeriod);
-    const target = (((i + 1n) * BigInt(e.securityTargetPerPeriod)) / BigInt(e.blocksPerPeriod)) -
-      ((i * BigInt(e.securityTargetPerPeriod)) / BigInt(e.blocksPerPeriod));
-    const { issuance } = issuanceFor({
-      validatorFeeShare: split.validators,
-      target,
-      pool: next.ledger.balanceOf(e.poolAddress),
-    });
+    const target = (((i + 1n) * perPeriod) / BigInt(e.blocksPerPeriod)) -
+      ((i * perPeriod) / BigInt(e.blocksPerPeriod));
+    let issuance;
+    if (!post) {
+      // Emission period: paid from the pool, topping validator income up to the target.
+      issuance = issuanceFor({
+        validatorFeeShare: split.validators,
+        target,
+        pool: next.ledger.balanceOf(e.poolAddress),
+      }).issuance;
+    } else {
+      // After emission: new units, the shortfall after fees, capped at postCapBps of circulating supply per year.
+      // Circulating = all balances except pool, treasury and fee account, taken from the state before this block.
+      const circulating = state.ledger.totalBalance([e.poolAddress, e.treasuryAddress, e.feeAddress]);
+      const blocksPerYear = BigInt(e.periodsPerYear) * BigInt(e.blocksPerPeriod);
+      const cap = (circulating * BigInt(e.postCapBps)) / (BPS_DENOMINATOR * blocksPerYear);
+      const shortfall = target > split.validators ? target - split.validators : 0n;
+      issuance = shortfall < cap ? shortfall : cap;
+    }
     // recipientsFor always sums to the amount it was given, so the validator share is paid exactly.
     for (const r of await recipientsFor(parent, state, config, split.validators)) {
       next.ledger.protocolMove({ from: e.feeAddress, to: r.address, amount: r.units });
@@ -359,7 +380,8 @@ async function settleEconomics(next, block, parent, state, config, fee) {
     }
     if (split.burn > 0n) next.ledger.protocolMove({ from: e.feeAddress, to: null, amount: split.burn });
     for (const r of await recipientsFor(parent, state, config, issuance)) {
-      next.ledger.protocolMove({ from: e.poolAddress, to: r.address, amount: r.units });
+      if (post) next.ledger.issue(r.address, r.units);
+      else next.ledger.protocolMove({ from: e.poolAddress, to: r.address, amount: r.units });
     }
     if (next.ledger.balanceOf(e.feeAddress) !== 0n) throw new Error("حساب الرسوم لم يُفرَّغ بالكامل.");
   } catch (err) {

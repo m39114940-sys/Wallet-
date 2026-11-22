@@ -244,7 +244,7 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
-    await applyUserTx(trial, tx, this.genesis, this.nextFee()); // throws with a specific code if invalid
+    await applyUserTx(trial, tx, this.genesis, this.nextFee(), this.tip.height + 1); // throws with a specific code if invalid
 
     this.mempool.set(id, tx);
     this.gossip("/tx", tx);
@@ -286,7 +286,7 @@ export class ChainNode {
     const fee = this.nextFee();
     for (const tx of this.mempool.values()) {
       try {
-        await applyUserTx(trial, tx, this.genesis, fee);
+        await applyUserTx(trial, tx, this.genesis, fee, this.tip.height + 1);
         included.push(tx);
       } catch {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
@@ -418,7 +418,7 @@ export class ChainNode {
     const fee = this.nextFee();
     for (const [id, tx] of [...this.mempool]) {
       try {
-        await applyUserTx(trial, tx, this.genesis, fee);
+        await applyUserTx(trial, tx, this.genesis, fee, this.tip.height + 1);
       } catch {
         this.mempool.delete(id);
       }

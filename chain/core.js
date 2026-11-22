@@ -201,7 +201,8 @@ export function validateGenesis(config) {
   }
   if (config.economics !== undefined) {
     if (config.stateRootV1 !== true) throw bad("الاقتصاد يتطلب جذر الحالة (stateRootV1) على سلسلة جديدة.");
-    validateEconomics(config.economics, bad);
+    if (config.allocations.length !== 0) throw bad("سلسلة الاقتصاد لا تستخدم صنبور التأسيس (allocations يجب أن تكون فارغة).");
+    validateEconomics(config.economics, bad, config);
   }
   const seen = new Set();
   for (const v of config.validators) {
@@ -244,8 +245,8 @@ export function genesisState(config) {
   // EVM accounts exist only on chains with stateRootV1. Their genesis funding is separate from the SNN allocations.
   if (config.stateRootV1 === true) state.evm = EvmAccounts.fromAllocations(config.evmAllocations ?? {});
   if (config.economics !== undefined) {
-    // The whole issuance pool is minted once at genesis, into its own account. Issuance later moves from there.
-    ledger.genesisMint(config.economics.poolAddress, BigInt(config.economics.issuancePool));
+    // The whole supply is minted once at genesis, per allocation. Locks apply afterwards, by vesting rule.
+    for (const a of config.economics.genesisAllocations) ledger.genesisMint(a.address, BigInt(a.units));
   }
   return state;
 }
@@ -259,7 +260,10 @@ export function genesisState(config) {
 
 const DECIMAL = /^(0|[1-9][0-9]{0,30})$/;
 
-function validateEconomics(e, bad) {
+// Total supply, fixed by the decision document: 100,000,000 SNN in micro-units.
+export const ECON_MAX_SUPPLY = 100_000_000n * 1_000_000n;
+
+function validateEconomics(e, bad, config) {
   if (e === null || typeof e !== "object") throw bad("إعدادات الاقتصاد غير صالحة.");
   const digits = (value, name) => {
     if (typeof value !== "string" || !DECIMAL.test(value)) throw bad(`${name} يجب أن يكون عدداً صحيحاً كنص.`);
@@ -287,6 +291,68 @@ function validateEconomics(e, bad) {
   }
   const addresses = new Set([e.feeAddress, e.treasuryAddress, e.poolAddress]);
   if (addresses.size !== 3) throw bad("حسابات الرسوم والخزينة والمجمع يجب أن تكون مختلفة.");
+  // Genesis allocations: the whole supply, each entry with an explicit vesting rule. Nothing defaults.
+  if (!Array.isArray(e.genesisAllocations) || e.genesisAllocations.length === 0) throw bad("توزيع التأسيس مطلوب.");
+  const seenAddresses = new Set();
+  let total = 0n;
+  for (const a of e.genesisAllocations) {
+    if (a === null || typeof a !== "object") throw bad("عنصر توزيع التأسيس غير صالح.");
+    if (!isValidAddress(a.address)) throw bad("عنوان في توزيع التأسيس غير صالح.");
+    if (seenAddresses.has(a.address)) throw bad("عنوان مكرر في توزيع التأسيس.");
+    seenAddresses.add(a.address);
+    const units = BigInt(digits(a.units, "مبلغ التوزيع"));
+    if (units === 0n) throw bad("مبلغ التوزيع يجب أن يكون أكبر من صفر.");
+    total += units;
+    if (a.vesting === null || typeof a.vesting !== "object") throw bad("قاعدة الاستحقاق مطلوبة لكل توزيع.");
+    digits(a.vesting.cliffBlocks, "مدة الانتظار");
+    digits(a.vesting.durationBlocks, "مدة التحرير");
+    if (BigInt(digits(a.vesting.cliffReleaseBps, "نسبة التحرير عند الانتظار")) > BPS_DENOMINATOR) {
+      throw bad("نسبة التحرير عند الانتظار يجب ألا تتجاوز 10000 نقطة أساس.");
+    }
+  }
+  if (total !== ECON_MAX_SUPPLY) throw bad("مجموع التوزيع يجب أن يساوي المعروض الأقصى بالضبط.");
+  const pool = e.genesisAllocations.find((a) => a.address === e.poolAddress);
+  if (pool === undefined || BigInt(pool.units) !== BigInt(e.issuancePool)) {
+    throw bad("حساب المجمع يجب أن يُمنح في التوزيع بمبلغ مجمع الإصدار بالضبط.");
+  }
+  if (seenAddresses.has(e.feeAddress)) throw bad("حساب الرسوم لا يُمنح في التوزيع.");
+}
+
+// Vesting: an allocation is locked until its schedule releases it. Locked units stay owned by the account and are never burned.
+// Release: nothing before cliffBlocks; then cliffReleaseBps at the cliff; the rest linearly over durationBlocks (0 = at once).
+export function vestingOf(config) {
+  const out = new Map();
+  if (config.economics === undefined) return out;
+  for (const a of config.economics.genesisAllocations) {
+    out.set(a.address, {
+      units: BigInt(a.units),
+      cliff: BigInt(a.vesting.cliffBlocks),
+      cliffBps: BigInt(a.vesting.cliffReleaseBps),
+      duration: BigInt(a.vesting.durationBlocks),
+    });
+  }
+  return out;
+}
+
+// Units still locked for one vesting entry at a block height.
+export function lockedAt(entry, height) {
+  const h = BigInt(height);
+  if (h < entry.cliff) return entry.units;
+  const cliffPart = (entry.units * entry.cliffBps) / BPS_DENOMINATOR;
+  const rest = entry.units - cliffPart;
+  const elapsed = h - entry.cliff;
+  const linear = elapsed >= entry.duration ? rest : (rest * elapsed) / entry.duration;
+  return entry.units - (cliffPart + linear);
+}
+
+// Total locked at a height, leaving out the listed accounts.
+export function lockedTotal(config, height, exclude = []) {
+  const skip = new Set(exclude);
+  let sum = 0n;
+  for (const [address, entry] of vestingOf(config)) {
+    if (!skip.has(address)) sum += lockedAt(entry, height);
+  }
+  return sum;
 }
 
 // Converts the genesis strings into the integer parameters used by econ/rules.js.
@@ -316,7 +382,16 @@ export function feeOf(parent, config) {
 }
 
 // Applies one user transfer and, on economics chains, moves its fee to feeAddress. Callers discard the state on error.
-export async function applyUserTx(state, tx, config, fee) {
+export async function applyUserTx(state, tx, config, fee, height) {
+  if (config.economics !== undefined) {
+    // Only the available part of a balance can be spent: balance minus what is still locked at this height.
+    const entry = vestingOf(config).get(tx.from);
+    const locked = entry === undefined ? 0n : lockedAt(entry, height);
+    const amount = parseAmount(tx.amount);
+    if (state.ledger.balanceOf(tx.from) - locked < amount + fee) {
+      throw new ChainError("LOCKED_FUNDS", "الرصيد المتاح غير كافٍ بسبب أقفال الاستحقاق.");
+    }
+  }
   await state.ledger.transfer(tx);
   if (config.economics !== undefined && fee > 0n) {
     state.ledger.protocolMove({ from: tx.from, to: config.economics.feeAddress, amount: fee });
@@ -364,8 +439,9 @@ async function settleEconomics(next, block, parent, state, config, fee) {
       }).issuance;
     } else {
       // After emission: new units, the shortfall after fees, capped at postCapBps of circulating supply per year.
-      // Circulating = all balances except pool, treasury and fee account, taken from the state before this block.
-      const circulating = state.ledger.totalBalance([e.poolAddress, e.treasuryAddress, e.feeAddress]);
+      // Circulating = balances except pool, treasury and fee account, minus what is still locked. Taken before this block.
+      const excluded = [e.poolAddress, e.treasuryAddress, e.feeAddress];
+      const circulating = state.ledger.totalBalance(excluded) - lockedTotal(config, block.height, excluded);
       const blocksPerYear = BigInt(e.periodsPerYear) * BigInt(e.blocksPerPeriod);
       const cap = (circulating * BigInt(e.postCapBps)) / (BPS_DENOMINATOR * blocksPerYear);
       const shortfall = target > split.validators ? target - split.validators : 0n;
@@ -625,7 +701,7 @@ async function applyBlockBody(state, block, parent, config, chain = null, requir
   const fee = feeOf(parent, config);
   for (const tx of block.txs) {
     try {
-      await applyUserTx(next, tx, config, fee);
+      await applyUserTx(next, tx, config, fee, block.height);
     } catch (err) {
       throw new ChainError("BAD_TX", `معاملة غير صالحة داخل الكتلة: ${err.message}`);
     }

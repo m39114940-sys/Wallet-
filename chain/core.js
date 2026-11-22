@@ -380,20 +380,21 @@ export function checkStateRoot(next, block, config) {
 // Call this before withWork, because work and certificates cover the hash.
 export async function attachStateRoot(state, block, parent, config, chain = null) {
   if (config.stateRootV1 !== true) return block;
-  const next = await applyBlockBody(state, block, parent, config, chain);
+  // Work is attached after this call, so the proof-of-work check is skipped here. applyBlock checks it later.
+  const next = await applyBlockBody(state, block, parent, config, chain, false);
   const out = { ...block, stateRoot: compositeStateRoot(next.ledger, EMPTY_EVM_ROOT) };
   out.hash = blockHashOf(out);
   return out;
 }
 
-async function applyBlockBody(state, block, parent, config, chain = null) {
+async function applyBlockBody(state, block, parent, config, chain = null, requireWork = true) {
   if (block === null || typeof block !== "object" || !Array.isArray(block.txs) || !Array.isArray(block.evidence)) {
     throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
   }
   if (block.height !== parent.height + 1) throw new ChainError("BAD_HEIGHT", "ارتفاع الكتلة غير متسلسل.");
   if (block.prevHash !== parent.hash) throw new ChainError("BAD_PARENT", "الكتلة لا تشير إلى الكتلة السابقة الصحيحة.");
   if (block.hash !== blockHashOf(block)) throw new ChainError("BAD_HASH", "بصمة الكتلة لا تطابق محتواها.");
-  if (config.rules === RULES_HYBRID) checkBlockWork(block, config, parent, chain);
+  if (config.rules === RULES_HYBRID && requireWork) checkBlockWork(block, config, parent, chain);
   for (const tx of block.txs) {
     if (canonicalJson(tx) !== canonicalJson(normalizeTx(tx))) {
       throw new ChainError("BAD_TX", "المعاملة تحتوي على حقول غير مسموحة.");

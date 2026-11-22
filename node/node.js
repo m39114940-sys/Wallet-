@@ -18,6 +18,7 @@ import { RULES_HYBRID, withWork } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
 import { peerFingerprintOf } from "./tls.js";
+import { handleRpc } from "./jsonrpc.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
@@ -506,6 +507,10 @@ export function createHttpServer(node, tlsOptions = null) {
       }
       if (req.method === "GET" && pathname === "/balance") {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
+      }
+      if (req.method === "POST" && pathname === "/rpc") {
+        const body = await readJson(req);
+        return sendJson(res, 200, handleRpc(node, body));
       }
       if (req.method === "POST" && pathname === "/tx") {
         const body = await readJson(req);

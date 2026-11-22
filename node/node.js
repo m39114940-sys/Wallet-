@@ -24,6 +24,7 @@ import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
   applyCommitted,
+  attachStateRoot,
   buildBlock,
   cloneState,
   evidenceKey,
@@ -256,8 +257,12 @@ export class ChainNode {
       txs: included,
       evidence,
     });
+    // Chains with stateRootV1 record the resulting state root before work is mined, since work covers the hash.
+    const sealed = this.genesis.stateRootV1 === true
+      ? await attachStateRoot(this.state, block, this.tip, this.genesis, this.blocks)
+      : block;
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
-    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis, this.tip, this.blocks) : block;
+    return this.genesis.rules === RULES_HYBRID ? withWork(sealed, this.genesis, this.tip, this.blocks) : sealed;
   }
 
   // ---------- Evidence ----------

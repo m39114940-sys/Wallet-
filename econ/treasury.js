@@ -175,3 +175,30 @@ export function applyWithdrawal(ledger, { treasuryAddress, lockedUnits = 0n, ins
   if (spendable < units) fail("INSUFFICIENT_SPENDABLE", "الرصيد القابل للصرف في الخزينة غير كافٍ.");
   return ledger.protocolMove({ from: treasuryAddress, to, amount: units });
 }
+
+// Stateless check for a withdrawal bundle: the chain can call this without holding the proposal in memory.
+// The bundle is valid only when:
+// - executeAfter equals the proposal height plus the configured timelock,
+// - the current height has reached executeAfter,
+// - at least `threshold` distinct configured signers signed the exact proposal,
+// - every signature in the bundle is valid. A bundle with an unknown or invalid signature is refused whole.
+export async function verifyWithdrawalBundle({ config, id, to, units, proposedAt, executeAfter, height, approvals }) {
+  const c = validateTreasuryConfig(config);
+  if (!Number.isSafeInteger(id) || id <= 0) fail("BAD_BUNDLE", "رقم الاقتراح غير صالح.");
+  if (typeof to !== "string" || to.length === 0) fail("BAD_BUNDLE", "عنوان المستلم مطلوب.");
+  if (typeof units !== "bigint" || units <= 0n) fail("BAD_BUNDLE", "المبلغ يجب أن يكون عدداً صحيحاً موجباً.");
+  if (executeAfter !== proposedAt + c.timelockBlocks) fail("BAD_BUNDLE", "القفل الزمني لا يطابق الإعدادات.");
+  if (height < executeAfter) fail("TIMELOCKED", "القفل الزمني لم ينتهِ بعد.");
+  if (!Array.isArray(approvals)) fail("BAD_BUNDLE", "قائمة الموافقات مطلوبة.");
+
+  const message = proposalMessage({ id, to, units, executeAfter });
+  const seen = new Set();
+  for (const { signer, signature } of approvals) {
+    if (!c.signers.includes(signer)) fail("NOT_SIGNER", "توقيع من غير الموقّعين المعتمدين.");
+    if (seen.has(signer)) fail("DUPLICATE_APPROVAL", "موافقة مكررة من الموقّع نفسه.");
+    if (!(await verifySignature(signer, signature, message))) fail("BAD_SIGNATURE", "توقيع غير صالح في الحزمة.");
+    seen.add(signer);
+  }
+  if (seen.size < c.threshold) fail("NOT_ENOUGH_APPROVALS", "عدد الموافقات أقل من العتبة.");
+  return true;
+}

@@ -65,7 +65,21 @@ function assertRecordShape(record, expectedHeight) {
   if (!DIGITS_PATTERN.test(String(record.amount)) || String(record.amount) === "0") {
     throw corrupt("مبلغ المعاملة غير صالح.");
   }
-  if (record.type === "faucet") {
+  if (record.type === "genesis") {
+    // Initial supply of a new chain. Allowed only before the first transfer or protocol move.
+    if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("سجل التأسيس يحتوي على حقول غير مسموحة.");
+    }
+    if (!isValidAddress(record.to)) throw corrupt("عنوان التأسيس غير صالح.");
+  } else if (record.type === "protocol") {
+    // Protocol move: fee, reward, issuance or burn. Never signed. `to` null means burned.
+    if (!isValidAddress(record.from) || (record.to !== null && !isValidAddress(record.to))) {
+      throw corrupt("عنوان حركة البروتوكول غير صالح.");
+    }
+    if (record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("حركة البروتوكول تحتوي على حقول غير مسموحة.");
+    }
+  } else if (record.type === "faucet") {
     if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
       throw corrupt("معاملة الصنبور تحتوي على حقول غير مسموحة.");
     }
@@ -109,6 +123,7 @@ export class Ledger {
   #nonces = new Map();
   #transactions = [];
   #faucetRecipients = new Set();
+  #sealed = false; // true after the first transfer or protocol move; genesis mints are refused from then on
 
   // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
   // Throws LEDGER_CORRUPT if the stored state cannot be reproduced exactly.
@@ -135,6 +150,10 @@ export class Ledger {
         assertRecordShape(record, index + 1);
         if (record.type === "faucet") {
           replayed.credit(record.to, BigInt(record.amount));
+        } else if (record.type === "genesis") {
+          replayed.genesisMint(record.to, BigInt(record.amount));
+        } else if (record.type === "protocol") {
+          replayed.protocolMove({ from: record.from, to: record.to, amount: BigInt(record.amount) });
         } else {
           await replayed.transfer({
             from: record.from,
@@ -242,7 +261,31 @@ export class Ledger {
     this.#balances.set(from, senderBalance - units);
     this.#balances.set(to, this.balanceOf(to) + units);
     this.#nonces.set(from, expected + 1);
+    this.#sealed = true;
     return this.#record({ type: "transfer", from, to, amount: units, nonce: expected, publicKey, signature });
+  }
+
+  // Initial supply of a new chain, minted once before any transfer or protocol move. Not available afterwards.
+  genesisMint(address, units) {
+    if (!isValidAddress(address)) throw new LedgerError("INVALID_RECIPIENT", "عنوان التأسيس غير صالح.");
+    if (typeof units !== "bigint" || units <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ التأسيس غير صالح.");
+    if (this.#sealed) throw new LedgerError("LEDGER_SEALED", "لا يمكن إنشاء وحدات بعد بدء الحركة على السلسلة.");
+    this.#balances.set(address, this.balanceOf(address) + units);
+    return this.#record({ type: "genesis", from: null, to: address, amount: units, nonce: null, publicKey: null, signature: null });
+  }
+
+  // Protocol move between accounts without a signature: fee, reward, issuance, or burn (to === null).
+  // Checks funds exactly like a transfer. Never creates units.
+  protocolMove({ from, to, amount }) {
+    if (!isValidAddress(from)) throw new LedgerError("INVALID_SENDER", "عنوان الحركة غير صالح.");
+    if (to !== null && !isValidAddress(to)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الحركة غير صالح.");
+    if (typeof amount !== "bigint" || amount <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ الحركة يجب أن يكون أكبر من صفر.");
+    const balance = this.balanceOf(from);
+    if (balance < amount) throw new LedgerError("INSUFFICIENT_FUNDS", "الرصيد غير كافٍ لحركة البروتوكول.");
+    this.#balances.set(from, balance - amount);
+    if (to !== null) this.#balances.set(to, this.balanceOf(to) + amount);
+    this.#sealed = true;
+    return this.#record({ type: "protocol", from, to, amount, nonce: null, publicKey: null, signature: null });
   }
 
   #record(tx) {

@@ -23,7 +23,7 @@ const FOREVER = "1000000000000"; // blocks: effectively locked for the test
 const unlocked = { cliffBlocks: "0", cliffReleaseBps: "10000", durationBlocks: "0" };
 const locked = { cliffBlocks: FOREVER, cliffReleaseBps: "0", durationBlocks: "0" };
 
-async function setup({ economics = true, feeOverrides = {} } = {}) {
+async function setup({ economics = true, feeOverrides = {}, withGenesis = true } = {}) {
   const alice = await makeAccount();
   const bob = await makeAccount();
   const fee = await makeAccount();
@@ -72,6 +72,8 @@ async function setup({ economics = true, feeOverrides = {} } = {}) {
     stateRootV1: true,
     ...(economics ? { economics: econ } : {}),
   });
+  // genesisState validates the config, so a refusal test asks for the raw config and validates it itself.
+  if (!withGenesis) return { alice, bob, fee, treasury, pool, founder, ops, keys, config };
   return { alice, bob, fee, treasury, pool, founder, ops, keys, config, genesis: genesisBlock(config), state0: genesisState(config) };
 }
 
@@ -104,7 +106,7 @@ test("genesis refuses economics without stateRootV1", async () => {
 });
 
 test("genesis refuses a fee split that does not total 100%", async () => {
-  const s = await setup({ feeOverrides: { feeSplitBps: { validators: "8500", securityTreasury: "1000", burn: "600" } } });
+  const s = await setup({ withGenesis: false, feeOverrides: { feeSplitBps: { validators: "8500", securityTreasury: "1000", burn: "600" } } });
   assert.throws(() => validateGenesis(s.config), (err) => err.code === "BAD_GENESIS");
 });
 

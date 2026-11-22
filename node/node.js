@@ -27,7 +27,10 @@ import {
   applyCommitted,
   attachStateRoot,
   buildBlock,
+  checkEvmEntryShape,
   cloneState,
+  evmChainIdOf,
+  evmEntryId,
   evidenceKey,
   genesisBlock,
   genesisState,
@@ -39,6 +42,8 @@ import {
   MAX_CLOCK_DRIFT_MS,
 } from "../chain/core.js";
 import { Consensus } from "../chain/consensus.js";
+import { applyTransferEntry } from "../evm/transfer.js";
+import { EvmError } from "../evm/errors.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
@@ -70,6 +75,7 @@ export class ChainNode {
     this.blocks = [];
     this.state = null;
     this.mempool = new Map();
+    this.evmMempool = new Map(); // signed EVM transfers waiting for a block; only on stateRootV1 chains
     this.evidence = new Map(); // evidenceKey -> verified evidence, waiting for a block
     this.queue = Promise.resolve();
     this.consensus = new Consensus({ node: this, keys: validator, roundMs });
@@ -235,8 +241,27 @@ export class ChainNode {
     return { txId: id, status: "accepted" };
   }
 
+  // Signed EVM transfers. Accepted only on stateRootV1 chains, and checked against the confirmed EVM state first.
+  async submitEvmTx(raw) {
+    if (this.genesis.stateRootV1 !== true) throw new ChainError("EVM_DISABLED", "معاملات EVM غير مفعّلة على هذه السلسلة.");
+    checkEvmEntryShape(raw);
+    const entry = { ...raw };
+    const id = evmEntryId(entry);
+    if (this.evmMempool.has(id)) return { evmTxId: id, status: "known" };
+    if (this.evmMempool.size >= MAX_MEMPOOL) throw new ChainError("MEMPOOL_FULL", "قائمة المعاملات المعلقة ممتلئة.");
+    try {
+      applyTransferEntry(this.state.evm.clone(), entry, evmChainIdOf(this.genesis));
+    } catch (err) {
+      if (err instanceof EvmError) throw new ChainError("BAD_EVM_TX", err.message);
+      throw err;
+    }
+    this.evmMempool.set(id, entry);
+    this.gossip("/evm-tx", entry);
+    return { evmTxId: id, status: "accepted" };
+  }
+
   hasPendingWork() {
-    return this.mempool.size > 0 || this.evidence.size > 0;
+    return this.mempool.size > 0 || this.evmMempool.size > 0 || this.evidence.size > 0;
   }
 
   // Builds the next block from the mempool, keeping only transactions that apply in order.
@@ -251,12 +276,15 @@ export class ChainNode {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
       }
     }
+    const evmTxs = this.selectEvmTxs();
     const block = buildBlock({
       height: this.tip.height + 1,
       timestamp: Math.max(Date.now(), this.tip.timestamp + 1), // milliseconds, strictly increasing
       prevHash: this.tip.hash,
       txs: included,
       evidence,
+      // Omitted when empty, so blocks without EVM entries keep exactly the bytes they had before.
+      ...(evmTxs.length > 0 ? { evmTxs } : {}),
     });
     // Chains with stateRootV1 record the resulting state root before work is mined, since work covers the hash.
     const sealed = this.genesis.stateRootV1 === true
@@ -264,6 +292,23 @@ export class ChainNode {
       : block;
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
     return this.genesis.rules === RULES_HYBRID ? withWork(sealed, this.genesis, this.tip, this.blocks) : sealed;
+  }
+
+  // EVM entries that apply in order on the confirmed EVM state. Invalid ones are skipped, as SNN transactions are.
+  selectEvmTxs() {
+    if (this.genesis.stateRootV1 !== true || this.evmMempool.size === 0) return [];
+    const trial = this.state.evm.clone();
+    const chainId = evmChainIdOf(this.genesis);
+    const chosen = [];
+    for (const entry of this.evmMempool.values()) {
+      try {
+        applyTransferEntry(trial, entry, chainId);
+        chosen.push(entry);
+      } catch {
+        // Invalid after earlier entries in this block. It is pruned after the commit.
+      }
+    }
+    return chosen;
   }
 
   // ---------- Evidence ----------
@@ -319,6 +364,7 @@ export class ChainNode {
     this.blocks.push(block);
     this.state = state;
     for (const tx of block.txs) this.mempool.delete(txId(tx));
+    for (const entry of block.evmTxs ?? []) this.evmMempool.delete(evmEntryId(entry));
     for (const ev of block.evidence) this.evidence.delete(evidenceKey(ev));
     for (const [key, ev] of this.evidence) {
       if (state.jailed.has(ev.validator)) this.evidence.delete(key);
@@ -335,6 +381,17 @@ export class ChainNode {
         await trial.ledger.transfer(tx);
       } catch {
         this.mempool.delete(id);
+      }
+    }
+    if (this.genesis.stateRootV1 === true) {
+      const evmTrial = this.state.evm.clone();
+      const chainId = evmChainIdOf(this.genesis);
+      for (const [id, entry] of [...this.evmMempool]) {
+        try {
+          applyTransferEntry(evmTrial, entry, chainId);
+        } catch {
+          this.evmMempool.delete(id);
+        }
       }
     }
   }
@@ -515,6 +572,10 @@ export function createHttpServer(node, tlsOptions = null) {
       if (req.method === "POST" && pathname === "/tx") {
         const body = await readJson(req);
         return sendJson(res, 200, await node.run(() => node.submitTx(body)));
+      }
+      if (req.method === "POST" && pathname === "/evm-tx") {
+        const body = await readJson(req);
+        return sendJson(res, 200, await node.run(() => node.submitEvmTx(body)));
       }
       if (req.method === "POST" && pathname === "/block") {
         const body = await readJson(req);

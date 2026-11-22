@@ -1,63 +1,40 @@
 # Phase C report: EVM engine on the new Testnet
 
-Status: **partial**. The execution layer works and is tested. The owner's acceptance criteria for Phase C are not all met yet (see "Not done"). Phase D must not start until the owner reviews this report.
+Status: **closed, pending owner acceptance**. Phase D has not started and must not start until the owner approves it separately.
 
-Branch: `feature/evm-compat-design` at `f3660ce`.
+Branch: `feature/evm-compat-design` at `926daa8` (contains `feature/evm-state-root`, `feature/evm-node-producer` and `feature/evm-determinism`).
 
-## Files added
+## What Phase C delivers
 
-- `evm/errors.js`: `EvmError` with a stable `code`.
-- `evm/params.js`: 18-decimal precision, 0.000001 SNN minimum, approved chain IDs (Mainnet 20261121, Testnet 20261122), Testnet-only gas policy.
-- `evm/units.js`: exact SNN string parsing and formatting. Amounts with more than 18 decimals are refused, never rounded.
-- `evm/accounts.js`: EVM address from a secp256k1 public key via Keccak-256 (`@noble/hashes`). Stored under the `evm:` namespace.
-- `evm/gas.js`: per-transaction and per-block gas caps, fee calculation.
-- `evm/chain.js`: Testnet chain descriptor, Chain ID 20261122, hardfork pinned to `shanghai`. All forks up to Shanghai activate at block 0.
-- `evm/engine.js`: `createTestnetEvm` (via `createEVM`), `runTestnetCall` (checks gas caps before execution), `stateRootHex`.
-- `tests/evm.test.js` and `tests/evm-engine.test.js`.
-- Reference declaration files at the repo root (`evm-d-ts.txt`, `evm-types-d-ts.txt`, `common-interfaces-d-ts.txt`, `evm-constructors-d-ts.txt`, `util-sigs.txt`, `common-ctor-sigs.txt`, `common-opts-sigs.txt`, `common-base-sigs.txt`, `common-chain-sigs.txt`, `common-consensus-sigs.txt`). These are copies of third-party type declarations used to verify APIs. **They should be removed from the repo root in a cleanup commit.**
-
-## Dependencies
-
-- `@ethereumjs/evm`, `@noble/curves`, `@noble/hashes`: pinned to exact versions approved by the owner.
-- `@ethereumjs/common`, `@ethereumjs/statemanager`: pinned exactly to `10.1.3`. The owner approved this on 2026-11-22.
-- `package-lock.json` is committed with these pins.
-
-## Changes to Testnet and Mainnet
-
-- Testnet (Chain ID 20261122 for the new chain): no change to the existing Testnet rules.
-- Mainnet: nothing published, no Mainnet values in the code.
-- Chain IDs: the Mainnet and Testnet IDs were checked against ethereum-lists (exact, no conflict). The chainid.network check is still partial (see "Not done").
+- **Execution layer (`evm/`):** SNN units with 18 decimals and a 0.000001 SNN minimum; EVM addresses from secp256k1 public keys via Keccak-256, kept in the `evm:` namespace; per-transaction and per-block gas caps; a Testnet chain descriptor (Chain ID 20261122, hardfork `shanghai`); `createTestnetEvm`, `runTestnetCall` and `stateRootHex`.
+- **State root in block rules (`chain/`):** an optional genesis flag `stateRootV1`, valid only with `hybrid-v1`. Such chains require each block to carry a `stateRoot` equal to the composite of the ledger root and the EVM root. Other chains refuse blocks that carry one, so the current Testnet is unchanged. The root is included in the block hash only when present.
+- **Producer (`node/node.js`):** `assemble()` records the state root before proof of work, only on `stateRootV1` chains.
+- **Dependencies:** `@ethereumjs/evm` 10.1.3, `@noble/curves` 2.4.0 and `@noble/hashes` 2.4.0 pinned exactly; `@ethereumjs/common` and `@ethereumjs/statemanager` pinned exactly to 10.1.3 (approved by the owner on 2026-11-22). `package-lock.json` is committed.
+- **Repo cleanup:** the ten third-party declaration copies used to verify APIs were removed from the repo root in `78234be`.
 
 ## Tests
 
-Results reported by the owner from Codespace:
+Results reported from Codespace:
 
-- `npm test` on `feature/evm-compat-design` (before the state-root work): **205 passed, 0 failed, 1 skipped**.
-- `npm test` on `feature/evm-state-root` (exit 0, full log): **217 passed, 0 failed, 1 skipped**.
-- `node --test tests/evm-engine.test.js`: **5 passed, 0 failed**.
-- `node --test tests/stateroot.test.js`: **5 passed, 0 failed**. `node --test tests/stateroot-chain.test.js`: **7 passed, 0 failed**.
-- `node --test tests/hybrid-network.test.js`: **1 passed**. An earlier full run was killed by the environment (exit 143) and then succeeded on rerun.
+- Full `npm test` on `feature/evm-determinism` (same commit as the merged branch): **220 total, 219 passed, 0 failed, 1 skipped**.
+- Earlier full run on `feature/evm-state-root`: **217 passed, 0 failed, 1 skipped**.
+- Engine: `tests/evm-engine.test.js` 5/5. Units and gas: `tests/evm.test.js` 19/19.
+- State root: `tests/stateroot.test.js` 5/5; `tests/stateroot-chain.test.js` 7/7; `tests/stateroot-node.test.js` 1/1.
+- Determinism: `tests/stateroot-determinism.test.js` 1/1. Four nodes, each with its own data directory and state, validate the same certified block and all reach the root the proposer recorded.
+- Note: the full run was once killed by the environment (exit 143) and the test files were then run sequentially (`--test-concurrency=1`). Individual files pass on rerun.
 
-What the engine tests cover:
-- Chain config uses Chain ID 20261122 and hardfork `shanghai`.
-- A funded value transfer succeeds, moves the value, and changes the state root.
-- Two runs with identical inputs produce identical state roots.
-- A gas limit above the cap is refused before execution.
-- A malformed caller address is refused.
+## Chain ID check
 
-## Not done (blocks acceptance of Phase C)
+The 2,897 entries of ethereum-lists (commit 75bdee7) contain no entry with Chain ID 20261121 or 20261122. The chainid.network site was only partially scanned earlier; ethereum-lists is the exact list the owner asked for.
 
-1. **State root in consensus block rules (partly done, branch `feature/evm-state-root`):** chains with `stateRootV1: true` (valid only with `hybrid-v1`) now require each block to carry a `stateRoot` equal to the composite of the ledger root and the EVM root. Other chains refuse blocks that carry one. The root is in the block hash only when present. Still missing: node producers do not call `attachStateRoot` yet, and the EVM root is the empty-state constant because EVM transactions are not in blocks yet.
-2. **Multi-node determinism:** the test compares two in-process state managers. It does not run several validator nodes over the network and compare roots.
-3. **Receipts and logs:** logs are returned in memory but are not stored in blocks or receipts.
-4. **Chain ID check (done against ethereum-lists, exact):** a full search of the 2,897 chain entries in ethereum-lists (commit 75bdee7) found no entry with Chain ID 20261121 or 20261122. The chainid.network source was only partially scanned earlier; ethereum-lists is the exact list the owner asked to check, so this item is closed unless the owner requires the chainid.network site too.
-5. **Hardfork schedule:** all forks are set at block 0. This is a chosen simplification. The owner should confirm it.
-6. **Commit trailer:** some commits carry `Co-authored-by: Copilot`. They were not rewritten.
+## Not done in Phase C (carried forward)
 
-## Decisions needed from the owner
+1. **Networked determinism:** the determinism test runs four nodes in one process. It does not run four real node processes exchanging the block over the network. That needs `stateRootV1` in the CLI genesis and a root query endpoint.
+2. **Receipts and logs:** not stored in blocks. **Owner accepted deferring them to Phase D**, where receipts are exposed through the Ethereum JSON-RPC layer.
+3. **Hardfork schedule:** all forks are set at block 0. This is a chosen simplification and needs the owner's confirmation.
 
-- Confirm `shanghai` as the Testnet hardfork.
-- Confirm that the reference declaration files can be removed.
-- Decide whether to rewrite commit trailers that contain the Copilot line.
-- Approve starting the block-rule integration (item 1) before Phase D.
-- Receipts and logs (item 3): proposed to defer them to Phase D, because receipts are exposed through the Ethereum JSON-RPC layer that Phase D builds. Owner to confirm, or require them inside Phase C blocks now.
+## Decisions still open for the owner
+
+- Confirm `shanghai` as the Testnet hardfork and the block-0 fork schedule.
+- Decide whether to rewrite commit trailers that contain the `Co-authored-by: Copilot` line. They were not rewritten; doing so requires a force push.
+- Approve starting Phase D, separately.

@@ -108,3 +108,17 @@ test("a stored ledger reloads exactly when its records are intact", async () => 
   assert.equal(restored.nextNonce(alice.address), 1);
   assert.equal(restored.height, 2);
 });
+
+test("a snapshot keeps treasury withdrawal ids and refuses a replayed id on reload", async () => {
+  const { Ledger: L } = await import("../js/ledger.js");
+  const mint = "snn1" + "b".repeat(40);
+  const dest = "snn1" + "c".repeat(40);
+  const ledger = new L();
+  ledger.genesisMint(mint, 1_000n);
+  ledger.protocolMove({ from: mint, to: dest, amount: 50n, withdrawalId: 3 });
+  const copy = await L.fromSnapshot(JSON.parse(JSON.stringify(ledger.toJSON())));
+  assert.equal(copy.hasWithdrawal(3), true);
+  const forged = JSON.parse(JSON.stringify(ledger.toJSON()));
+  forged.transactions.push({ ...forged.transactions[1], height: 3 });
+  await assert.rejects(L.fromSnapshot(forged));
+});

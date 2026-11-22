@@ -6,7 +6,7 @@
 // Stakes and weights are integers (micro-SNN units), so slashing and quorum use exact arithmetic.
 
 import { validateWork, mine, nextTarget, PowError } from "./pow.js";
-import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
+import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
 import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
 import { compositeStateRoot } from "./stateroot.js";
@@ -16,6 +16,7 @@ import { EVM_CHAIN_IDS } from "../evm/params.js";
 import { EvmError } from "../evm/errors.js";
 import { validateParams, feeForUtilisation, splitFee, issuanceFor, BPS_DENOMINATOR, EconError } from "../econ/rules.js";
 import { addressFromPublicKey, fromHex } from "../js/signing.js";
+import { validateTreasuryConfig, verifyWithdrawalBundle, applyWithdrawal, TreasuryError } from "../econ/treasury.js";
 import { isValidAddress } from "../js/ledger.js";
 
 export const GENESIS_PREV_HASH = "0".repeat(64);
@@ -39,8 +40,33 @@ export class ChainError extends Error {
 
 // Only these fields exist in a transaction. Amounts are rewritten to one canonical decimal form,
 // so "2.5" and "2.50" cannot produce two different transaction ids for the same transfer.
+export const WITHDRAWAL_TYPE = "treasury-withdraw";
+export const isWithdrawal = (tx) => tx !== null && typeof tx === "object" && tx.type === WITHDRAWAL_TYPE;
+
+// Treasury withdrawal: carries the proposal and its signer approvals. Verified in applyTreasuryWithdrawal.
+function normalizeWithdrawal(tx) {
+  if (!Number.isSafeInteger(tx.id) || tx.id <= 0) throw new ChainError("BAD_TX", "رقم السحب غير صالح.");
+  if (typeof tx.to !== "string") throw new ChainError("BAD_TX", "مستلم السحب مطلوب.");
+  if (typeof tx.units !== "string" || !/^[1-9][0-9]*$/.test(tx.units)) throw new ChainError("BAD_TX", "مبلغ السحب غير صالح.");
+  if (!Number.isSafeInteger(tx.proposedAt) || !Number.isSafeInteger(tx.executeAfter)) throw new ChainError("BAD_TX", "ارتفاعات السحب غير صالحة.");
+  if (!Array.isArray(tx.approvals)) throw new ChainError("BAD_TX", "قائمة موافقات السحب مطلوبة.");
+  return {
+    type: WITHDRAWAL_TYPE,
+    id: tx.id,
+    to: tx.to,
+    units: tx.units,
+    proposedAt: tx.proposedAt,
+    executeAfter: tx.executeAfter,
+    approvals: tx.approvals.map((a) => {
+      if (a === null || typeof a !== "object") throw new ChainError("BAD_TX", "موافقة السحب غير صالحة.");
+      return { signer: a.signer, signature: a.signature };
+    }),
+  };
+}
+
 export function normalizeTx(tx) {
   if (tx === null || typeof tx !== "object") throw new ChainError("BAD_TX", "المعاملة غير صالحة.");
+  if (isWithdrawal(tx)) return normalizeWithdrawal(tx);
   return {
     from: tx.from,
     to: tx.to,
@@ -270,6 +296,13 @@ function validateEconomics(e, bad, config) {
     return value;
   };
   const params = economicsParamsOf(e, bad);
+  if (e.treasury !== undefined) {
+    try {
+      validateTreasuryConfig(e.treasury);
+    } catch (err) {
+      throw bad(`إعدادات الخزينة غير صالحة: ${err.message}`);
+    }
+  }
   try {
     validateParams(params);
   } catch (err) {
@@ -383,6 +416,7 @@ export function feeOf(parent, config) {
 
 // Applies one user transfer and, on economics chains, moves its fee to feeAddress. Callers discard the state on error.
 export async function applyUserTx(state, tx, config, fee, height) {
+  if (isWithdrawal(tx)) return applyTreasuryWithdrawal(state, tx, config, height);
   if (config.economics !== undefined) {
     // Only the available part of a balance can be spent: balance minus what is still locked at this height.
     const entry = vestingOf(config).get(tx.from);
@@ -421,7 +455,9 @@ async function settleEconomics(next, block, parent, state, config, fee) {
   const e = config.economics;
   const params = economicsParamsOf(e);
   try {
-    const feesTotal = fee * BigInt(block.txs.length);
+    // Withdrawals pay no user fee, so only transfers count toward the fee pool.
+    const feePayers = block.txs.filter((t) => !isWithdrawal(t)).length;
+    const feesTotal = fee * BigInt(feePayers);
     const split = splitFee(feesTotal, params.feeSplitBps);
     // Validator share, then issuance. Both go to the parent's certificate signers. Without signers, the treasury gets them.
     const post = BigInt(block.height) > BigInt(e.emissionBlocks);
@@ -463,6 +499,38 @@ async function settleEconomics(next, block, parent, state, config, fee) {
   } catch (err) {
     if (err instanceof ChainError) throw err;
     throw new ChainError("BAD_ECONOMICS", `تسوية الاقتصاد غير صالحة: ${err.message}`);
+  }
+}
+
+// Applies an approved treasury withdrawal. Refused unless the bundle verifies, the id is new, and the
+// amount fits the treasury's spendable balance. Withdrawals pay no user fee.
+async function applyTreasuryWithdrawal(state, tx, config, height) {
+  const e = config.economics;
+  if (e === undefined || e.treasury === undefined) throw new ChainError("BAD_TX", "السحب من الخزينة غير مفعّل في هذه السلسلة.");
+  if (state.ledger.hasWithdrawal(tx.id)) throw new ChainError("WITHDRAWAL_REPLAY", "هذا السحب نُفّذ بالفعل.");
+  const units = BigInt(tx.units);
+  try {
+    await verifyWithdrawalBundle({
+      config: e.treasury,
+      id: tx.id,
+      to: tx.to,
+      units,
+      proposedAt: tx.proposedAt,
+      executeAfter: tx.executeAfter,
+      height,
+      approvals: tx.approvals,
+    });
+    const entry = vestingOf(config).get(e.treasuryAddress);
+    const lockedUnits = entry === undefined ? 0n : lockedAt(entry, height);
+    applyWithdrawal(state.ledger, {
+      treasuryAddress: e.treasuryAddress,
+      lockedUnits,
+      instruction: { to: tx.to, units },
+      withdrawalId: tx.id,
+    });
+  } catch (err) {
+    if (err instanceof TreasuryError || err instanceof LedgerError) throw new ChainError(err.code, err.message);
+    throw err;
   }
 }
 

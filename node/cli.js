@@ -33,7 +33,7 @@ const host = args.host ?? "127.0.0.1";
 const port = Number(args.port);
 if (!Number.isInteger(port) || !args.data || !args.genesis || !args["validator-key"]) {
   fail(
-    "required: --port <n> --data <dir> --genesis <file> --validator-key <file> [--peer <https-url>]... [--round-ms <n>]",
+    "required: --port <n> --data <dir> --genesis <file> --validator-key <file> [--peer <https-url>]... [--round-ms <n>] [--store json|log]",
   );
 }
 
@@ -54,6 +54,9 @@ if (fingerprintOfPem(validator.tls.cert) !== entry.tlsFingerprint) {
 for (const peer of args.peers) {
   if (!peer.startsWith("https://")) fail(`peer must use https: ${peer}`);
 }
+// --store json (default, chain.json) or log (append-only blocks-log/). Existing nodes keep json unless started with --store log.
+const storage = args.store ?? "json";
+if (storage !== "json" && storage !== "log") fail("--store must be json or log");
 
 const node = new ChainNode({
   dataDir: args.data,
@@ -67,6 +70,7 @@ const node = new ChainNode({
   selfUrl: args.self ?? `https://${host}:${port}`,
   roundMs: Number(args["round-ms"] ?? 1000),
   log: (msg) => console.error(JSON.stringify({ event: "log", msg })),
+  storage,
 });
 await node.init();
 for (const peer of args.peers) node.addPeer(peer);

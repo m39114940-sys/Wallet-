@@ -62,3 +62,19 @@ test("reading outside the log is refused", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a line cut short by a power loss is reported as corruption with a clear reason", () => {
+  const dir = tempDir();
+  try {
+    const log = new RecordLog(dir, { segmentRecords: 10 });
+    log.append({ n: 1 });
+    const path = join(dir, "seg-000001.log");
+    writeFileSync(path, readFileSync(path, "utf8") + '{"seq":2,"prev":"ab');
+    assert.throws(
+      () => new RecordLog(dir, { segmentRecords: 10 }),
+      (e) => e instanceof RecordLogError && e.code === "LOG_CORRUPT" && e.message.includes("غير مكتمل"),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -18,6 +18,15 @@ export class RecordLogError extends Error {
   }
 }
 
+// A line that is not valid JSON is most often a write cut short by a power loss. Refuse it with a clear reason.
+function parseLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    throw new RecordLogError("LOG_CORRUPT", "سطر غير مكتمل أو تالف في السجل (ربما انقطاع أثناء الكتابة).");
+  }
+}
+
 const hashOf = (seq, prev, record) =>
   createHash("sha256").update(canonicalJson({ seq, prev, record })).digest("hex");
 
@@ -58,7 +67,7 @@ export class RecordLog {
     for (const name of names) {
       const lines = readFileSync(join(this.#dir, name), "utf8").split("\n").filter((l) => l.length > 0);
       for (const line of lines) {
-        this.#checkEntry(JSON.parse(line));
+        this.#checkEntry(parseLine(line));
       }
     }
   }
@@ -100,7 +109,7 @@ export class RecordLog {
     }
     const index = Math.floor((seq - 1) / this.#segmentRecords) + 1;
     const lines = readFileSync(join(this.#dir, segmentName(index)), "utf8").split("\n").filter((l) => l.length > 0);
-    const entry = JSON.parse(lines[(seq - 1) % this.#segmentRecords]);
+    const entry = parseLine(lines[(seq - 1) % this.#segmentRecords]);
     if (entry.seq !== seq || entry.hash !== hashOf(entry.seq, entry.prev, entry.record)) {
       throw new RecordLogError("LOG_CORRUPT", `السجل ${seq} تالف.`);
     }

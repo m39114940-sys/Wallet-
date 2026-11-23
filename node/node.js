@@ -8,7 +8,9 @@
 // - Messages are not retransmitted. Liveness relies on round timeouts and fresh votes.
 // - Each node sends the full chain on sync. There is no pruning or snapshot.
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs";
+import { RecordLog } from "../js/record-log.js";
+const BLOCK_LOG_DIR = "blocks-log";
 import { join } from "node:path";
 import http from "node:http";
 import https from "node:https";
@@ -18,14 +20,21 @@ import { RULES_HYBRID, withWork } from "../chain/core.js";
 import { decideAdoption, keepsCommittedPrefix } from "../chain/forkchoice.js";
 import { PeerGuard } from "./guard.js";
 import { peerFingerprintOf } from "./tls.js";
+import { handleRpc } from "./jsonrpc.js";
 
 const MAX_AUTHENTICATED_PEERS = 1000;
 import { LedgerError } from "../js/ledger.js";
 import {
   ChainError,
   applyCommitted,
+  attachStateRoot,
   buildBlock,
+  checkEvmEntryShape,
   cloneState,
+  applyUserTx,
+  feeOf,
+  evmChainIdOf,
+  evmEntryId,
   evidenceKey,
   genesisBlock,
   genesisState,
@@ -37,6 +46,9 @@ import {
   MAX_CLOCK_DRIFT_MS,
 } from "../chain/core.js";
 import { Consensus } from "../chain/consensus.js";
+import { applyTransferEntry } from "../evm/transfer.js";
+import { receiptsOfBlock } from "../chain/receipts.js";
+import { EvmError } from "../evm/errors.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 const PEER_TIMEOUT_MS = 3000;
@@ -52,7 +64,13 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+  // storage: "json" (default, chain.json rewritten on every change) or "log" (blocks appended to blocks-log/).
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {}, storage = "json" }) {
+    if (storage !== "json" && storage !== "log") throw new Error("نوع التخزين غير معروف.");
+    this.storage = storage;
+    this.blockLog = null; // RecordLog of blocks, opened in log mode
+    this.loggedCount = 0; // how many blocks of this.blocks are already in the log
+    this.loggedHash = null; // hash of the last logged block
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
     this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
     this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
@@ -68,6 +86,9 @@ export class ChainNode {
     this.blocks = [];
     this.state = null;
     this.mempool = new Map();
+    this.evmMempool = new Map(); // signed EVM transfers waiting for a block; only on stateRootV1 chains
+    this.evmReceipts = new Map(); // transaction hash -> receipt, derived from the blocks (see syncReceiptIndex)
+    this.receiptIndex = { height: -1, hash: null }; // last block indexed
     this.evidence = new Map(); // evidenceKey -> verified evidence, waiting for a block
     this.queue = Promise.resolve();
     this.consensus = new Consensus({ node: this, keys: validator, roundMs });
@@ -114,6 +135,17 @@ export class ChainNode {
   async init() {
     mkdirSync(this.dataDir, { recursive: true });
     const chainPath = join(this.dataDir, "chain.json");
+    if (this.storage === "log") this.recoverBlockLog();
+    if (this.storage === "log" && existsSync(join(this.dataDir, BLOCK_LOG_DIR))) {
+      this.blockLog = new RecordLog(join(this.dataDir, BLOCK_LOG_DIR));
+      const blocks = [];
+      for (let i = 1; i <= this.blockLog.length; i++) blocks.push(this.blockLog.get(i));
+      this.state = await replayChain(blocks, this.genesis);
+      this.blocks = blocks;
+      this.loggedCount = blocks.length;
+      this.loggedHash = blocks[blocks.length - 1].hash;
+      return;
+    }
     if (!existsSync(chainPath)) {
       this.blocks = [genesisBlock(this.genesis)];
       this.state = genesisState(this.genesis);
@@ -127,10 +159,47 @@ export class ChainNode {
   }
 
   persist() {
+    if (this.storage === "log") return this.persistLog();
     const path = join(this.dataDir, "chain.json");
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, JSON.stringify({ blocks: this.blocks }));
     renameSync(tmp, path); // atomic replace on the same filesystem
+  }
+
+  // Finishes or discards an interrupted reorg rewrite. A complete tmp copy that was never moved in is dropped;
+  // an old copy left aside without its replacement is moved back, so the last committed log is always the one used.
+  recoverBlockLog() {
+    const dir = join(this.dataDir, BLOCK_LOG_DIR);
+    const old = `${dir}.old`;
+    if (!existsSync(dir) && existsSync(old)) renameSync(old, dir);
+    else if (existsSync(old)) rmSync(old, { recursive: true, force: true });
+    rmSync(`${dir}.tmp`, { recursive: true, force: true });
+  }
+
+  // Log mode: append only the blocks not yet logged. If the chain was replaced (a reorg), rewrite the whole log.
+  persistLog() {
+    const dir = join(this.dataDir, BLOCK_LOG_DIR);
+    const diverged =
+      this.loggedCount > this.blocks.length ||
+      (this.loggedCount > 0 && this.blocks[this.loggedCount - 1].hash !== this.loggedHash);
+    if (diverged) {
+      const tmp = `${dir}.tmp`;
+      const old = `${dir}.old`;
+      rmSync(tmp, { recursive: true, force: true });
+      const fresh = new RecordLog(tmp);
+      for (const block of this.blocks) fresh.append(block);
+      // Move the old copy aside first, so a crash never leaves the directory missing.
+      rmSync(old, { recursive: true, force: true });
+      if (existsSync(dir)) renameSync(dir, old);
+      renameSync(tmp, dir);
+      rmSync(old, { recursive: true, force: true });
+      this.blockLog = new RecordLog(dir);
+    } else {
+      if (this.blockLog === null) this.blockLog = new RecordLog(dir);
+      for (let i = this.loggedCount; i < this.blocks.length; i++) this.blockLog.append(this.blocks[i]);
+    }
+    this.loggedCount = this.blocks.length;
+    this.loggedHash = this.blocks[this.blocks.length - 1].hash;
   }
 
   get tip() {
@@ -218,6 +287,11 @@ export class ChainNode {
 
   // ---------- Transactions ----------
 
+  // Fee the next block will charge per transaction. Zero unless the genesis names economics.
+  nextFee() {
+    return feeOf(this.tip, this.genesis);
+  }
+
   async submitTx(raw) {
     const tx = normalizeTx(raw);
     const id = txId(tx);
@@ -226,38 +300,110 @@ export class ChainNode {
 
     // Full check against the confirmed state. The nonce must be the sender's next confirmed nonce.
     const trial = await cloneState(this.state);
-    await trial.ledger.transfer(tx); // throws LedgerError with a specific code if invalid
+    await applyUserTx(trial, tx, this.genesis, this.nextFee(), this.tip.height + 1); // throws with a specific code if invalid
 
     this.mempool.set(id, tx);
     this.gossip("/tx", tx);
     return { txId: id, status: "accepted" };
   }
 
+  // Signed EVM transfers. Accepted only on stateRootV1 chains, and checked against the confirmed EVM state first.
+  // Synchronous: every check is in memory, and the JSON-RPC layer answers in the same call.
+  async submitEvmTx(raw) {
+    return this.addEvmEntry(raw);
+  }
+
+  addEvmEntry(raw) {
+    if (this.genesis.stateRootV1 !== true) throw new ChainError("EVM_DISABLED", "معاملات EVM غير مفعّلة على هذه السلسلة.");
+    checkEvmEntryShape(raw);
+    const entry = { ...raw };
+    const id = evmEntryId(entry);
+    if (this.evmMempool.has(id)) return { evmTxId: id, status: "known" };
+    if (this.evmMempool.size >= MAX_MEMPOOL) throw new ChainError("MEMPOOL_FULL", "قائمة المعاملات المعلقة ممتلئة.");
+    try {
+      applyTransferEntry(this.state.evm.clone(), entry, evmChainIdOf(this.genesis));
+    } catch (err) {
+      if (err instanceof EvmError) throw new ChainError("BAD_EVM_TX", err.message);
+      throw err;
+    }
+    this.evmMempool.set(id, entry);
+    this.gossip("/evm-tx", entry);
+    return { evmTxId: id, status: "accepted" };
+  }
+
   hasPendingWork() {
-    return this.mempool.size > 0 || this.evidence.size > 0;
+    return this.mempool.size > 0 || this.evmMempool.size > 0 || this.evidence.size > 0;
   }
 
   // Builds the next block from the mempool, keeping only transactions that apply in order.
   async assemble(evidence) {
     const trial = await cloneState(this.state);
     const included = [];
+    const fee = this.nextFee();
     for (const tx of this.mempool.values()) {
       try {
-        await trial.ledger.transfer(tx);
+        await applyUserTx(trial, tx, this.genesis, fee, this.tip.height + 1);
         included.push(tx);
       } catch {
         // Invalid after earlier transactions in this block. It is pruned after the commit.
       }
     }
+    const evmTxs = this.selectEvmTxs();
     const block = buildBlock({
       height: this.tip.height + 1,
       timestamp: Math.max(Date.now(), this.tip.timestamp + 1), // milliseconds, strictly increasing
       prevHash: this.tip.hash,
       txs: included,
       evidence,
+      // Omitted when empty, so blocks without EVM entries keep exactly the bytes they had before.
+      ...(evmTxs.length > 0 ? { evmTxs } : {}),
     });
+    // Chains with stateRootV1 record the resulting state root before work is mined, since work covers the hash.
+    const sealed = this.genesis.stateRootV1 === true
+      ? await attachStateRoot(this.state, block, this.tip, this.genesis, this.blocks)
+      : block;
     // Under hybrid rules every block carries proof of work. Mining happens here, on the node that proposes.
-    return this.genesis.rules === RULES_HYBRID ? withWork(block, this.genesis, this.tip, this.blocks) : block;
+    return this.genesis.rules === RULES_HYBRID ? withWork(sealed, this.genesis, this.tip, this.blocks) : sealed;
+  }
+
+  // Receipt for an EVM transaction hash that is in a committed block, or null.
+  evmReceipt(hash) {
+    this.syncReceiptIndex();
+    return this.evmReceipts.get(hash) ?? null;
+  }
+
+  // The index follows the chain: new blocks are added, and it is rebuilt when a block it indexed is no longer on the chain.
+  syncReceiptIndex() {
+    let { height, hash } = this.receiptIndex;
+    if (height >= 0 && (height >= this.blocks.length || this.blocks[height].hash !== hash)) {
+      this.evmReceipts = new Map();
+      height = -1;
+      hash = null;
+    }
+    for (let h = height + 1; h < this.blocks.length; h++) {
+      const block = this.blocks[h];
+      for (const { hash: txHash, receipt } of receiptsOfBlock(block)) this.evmReceipts.set(txHash, receipt);
+      height = h;
+      hash = block.hash;
+    }
+    this.receiptIndex = { height, hash };
+  }
+
+  // EVM entries that apply in order on the confirmed EVM state. Invalid ones are skipped, as SNN transactions are.
+  selectEvmTxs() {
+    if (this.genesis.stateRootV1 !== true || this.evmMempool.size === 0) return [];
+    const trial = this.state.evm.clone();
+    const chainId = evmChainIdOf(this.genesis);
+    const chosen = [];
+    for (const entry of this.evmMempool.values()) {
+      try {
+        applyTransferEntry(trial, entry, chainId);
+        chosen.push(entry);
+      } catch {
+        // Invalid after earlier entries in this block. It is pruned after the commit.
+      }
+    }
+    return chosen;
   }
 
   // ---------- Evidence ----------
@@ -313,6 +459,7 @@ export class ChainNode {
     this.blocks.push(block);
     this.state = state;
     for (const tx of block.txs) this.mempool.delete(txId(tx));
+    for (const entry of block.evmTxs ?? []) this.evmMempool.delete(evmEntryId(entry));
     for (const ev of block.evidence) this.evidence.delete(evidenceKey(ev));
     for (const [key, ev] of this.evidence) {
       if (state.jailed.has(ev.validator)) this.evidence.delete(key);
@@ -324,11 +471,23 @@ export class ChainNode {
   // Drops mempool entries that no longer apply after a block changed the state.
   async pruneMempool() {
     const trial = await cloneState(this.state);
+    const fee = this.nextFee();
     for (const [id, tx] of [...this.mempool]) {
       try {
-        await trial.ledger.transfer(tx);
+        await applyUserTx(trial, tx, this.genesis, fee, this.tip.height + 1);
       } catch {
         this.mempool.delete(id);
+      }
+    }
+    if (this.genesis.stateRootV1 === true) {
+      const evmTrial = this.state.evm.clone();
+      const chainId = evmChainIdOf(this.genesis);
+      for (const [id, entry] of [...this.evmMempool]) {
+        try {
+          applyTransferEntry(evmTrial, entry, chainId);
+        } catch {
+          this.evmMempool.delete(id);
+        }
       }
     }
   }
@@ -502,9 +661,17 @@ export function createHttpServer(node, tlsOptions = null) {
       if (req.method === "GET" && pathname === "/balance") {
         return sendJson(res, 200, node.balance(url.searchParams.get("address") ?? ""));
       }
+      if (req.method === "POST" && pathname === "/rpc") {
+        const body = await readJson(req);
+        return sendJson(res, 200, handleRpc(node, body));
+      }
       if (req.method === "POST" && pathname === "/tx") {
         const body = await readJson(req);
         return sendJson(res, 200, await node.run(() => node.submitTx(body)));
+      }
+      if (req.method === "POST" && pathname === "/evm-tx") {
+        const body = await readJson(req);
+        return sendJson(res, 200, await node.run(() => node.submitEvmTx(body)));
       }
       if (req.method === "POST" && pathname === "/block") {
         const body = await readJson(req);

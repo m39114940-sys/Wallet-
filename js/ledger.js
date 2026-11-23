@@ -10,7 +10,6 @@ import { verifyTransferSignature } from "./signing.js";
 export const UNITS_PER_SNN = 1_000_000n;
 export const TESTNET_FAUCET_UNITS = 100n * UNITS_PER_SNN;
 export const ADDRESS_PATTERN = /^snn1[0-9a-f]{40}$/;
-export const MAX_TRANSACTIONS = 10_000;
 
 const DIGITS_PATTERN = /^(0|[1-9][0-9]{0,17})$/; // up to 18 digits, so a stored amount can never be absurdly large
 const PUBLIC_KEY_HEX = /^[0-9a-f]{64}$/;
@@ -60,12 +59,37 @@ const corrupt = (detail) => new LedgerError("LEDGER_CORRUPT", `سجل المحف
 function assertRecordShape(record, expectedHeight) {
   if (!isPlainObject(record)) throw corrupt("سجل غير صالح.");
   const keys = Object.keys(record).sort();
-  if (keys.join() !== [...RECORD_FIELDS].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
+  // Protocol moves may carry a treasury withdrawal id; no other record type does.
+  const allowed = record.type === "protocol" && Object.hasOwn(record, "withdrawalId") ? [...RECORD_FIELDS, "withdrawalId"] : RECORD_FIELDS;
+  if (keys.join() !== [...allowed].sort().join()) throw corrupt("حقول السجل غير مطابقة.");
   if (record.height !== expectedHeight) throw corrupt("ترقيم المعاملات غير متسلسل.");
   if (!DIGITS_PATTERN.test(String(record.amount)) || String(record.amount) === "0") {
     throw corrupt("مبلغ المعاملة غير صالح.");
   }
-  if (record.type === "faucet") {
+  if (record.type === "genesis") {
+    // Initial supply of a new chain. Allowed only before the first transfer or protocol move.
+    if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("سجل التأسيس يحتوي على حقول غير مسموحة.");
+    }
+    if (!isValidAddress(record.to)) throw corrupt("عنوان التأسيس غير صالح.");
+  } else if (record.type === "issue") {
+    // Post-emission issuance: new units minted by protocol rules. The cap is enforced by the chain, not here.
+    if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("سجل الإصدار يحتوي على حقول غير مسموحة.");
+    }
+    if (!isValidAddress(record.to)) throw corrupt("عنوان الإصدار غير صالح.");
+  } else if (record.type === "protocol") {
+    // Protocol move: fee, reward, issuance or burn. Never signed. `to` null means burned.
+    if (!isValidAddress(record.from) || (record.to !== null && !isValidAddress(record.to))) {
+      throw corrupt("عنوان حركة البروتوكول غير صالح.");
+    }
+    if (record.nonce !== null || record.publicKey !== null || record.signature !== null) {
+      throw corrupt("حركة البروتوكول تحتوي على حقول غير مسموحة.");
+    }
+    if (record.withdrawalId !== undefined && (!Number.isSafeInteger(record.withdrawalId) || record.withdrawalId <= 0)) {
+      throw corrupt("رقم السحب في حركة البروتوكول غير صالح.");
+    }
+  } else if (record.type === "faucet") {
     if (record.from !== null || record.nonce !== null || record.publicKey !== null || record.signature !== null) {
       throw corrupt("معاملة الصنبور تحتوي على حقول غير مسموحة.");
     }
@@ -100,6 +124,7 @@ function canonicalState({ balances, nonces, transactions }) {
       tx.nonce ?? null,
       tx.publicKey ?? null,
       tx.signature ?? null,
+      tx.withdrawalId ?? null,
     ]),
   });
 }
@@ -109,32 +134,29 @@ export class Ledger {
   #nonces = new Map();
   #transactions = [];
   #faucetRecipients = new Set();
+  #withdrawals = new Set(); // treasury withdrawal ids already executed; a repeat is refused
+  #log = null; // optional append-only log that mirrors every record
+  #sealed = false; // true after the first transfer or protocol move; genesis mints are refused from then on
 
-  // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
-  // Throws LEDGER_CORRUPT if the stored state cannot be reproduced exactly.
-  static async fromSnapshot(snapshot) {
-    if (!isPlainObject(snapshot) || !Array.isArray(snapshot.transactions)) {
-      throw corrupt("شكل السجل غير صالح.");
-    }
-    if (snapshot.transactions.length > MAX_TRANSACTIONS) {
-      throw corrupt("عدد المعاملات يتجاوز الحد المسموح.");
-    }
-    if (!isPlainObject(snapshot.balances) || !isPlainObject(snapshot.nonces)) {
-      throw corrupt("الأرصدة أو الأرقام التسلسلية غير صالحة.");
-    }
-    for (const [address, units] of Object.entries(snapshot.balances)) {
-      if (!isValidAddress(address) || !DIGITS_PATTERN.test(String(units))) throw corrupt("رصيد غير صالح.");
-    }
-    for (const [address, n] of Object.entries(snapshot.nonces)) {
-      if (!isValidAddress(address) || !Number.isSafeInteger(n) || n < 0) throw corrupt("رقم تسلسلي غير صالح.");
-    }
-
+  // Replays records from scratch, verifying each signature, nonce and record shape.
+  static async #replay(transactions) {
     const replayed = new Ledger();
     try {
-      for (const [index, record] of snapshot.transactions.entries()) {
+      for (const [index, record] of transactions.entries()) {
         assertRecordShape(record, index + 1);
         if (record.type === "faucet") {
           replayed.credit(record.to, BigInt(record.amount));
+        } else if (record.type === "genesis") {
+          replayed.genesisMint(record.to, BigInt(record.amount));
+        } else if (record.type === "issue") {
+          replayed.issue(record.to, BigInt(record.amount));
+        } else if (record.type === "protocol") {
+          replayed.protocolMove({
+            from: record.from,
+            to: record.to,
+            amount: BigInt(record.amount),
+            ...(record.withdrawalId !== undefined ? { withdrawalId: record.withdrawalId } : {}),
+          });
         } else {
           await replayed.transfer({
             from: record.from,
@@ -151,6 +173,44 @@ export class Ledger {
       throw corrupt(err instanceof LedgerError ? err.message : "فشل التحقق من المعاملات.");
     }
 
+    return replayed;
+  }
+
+  // Rebuilds the ledger from its append-only log, then keeps appending to that log.
+  static async fromLog(log) {
+    const transactions = [];
+    for (let i = 1; i <= log.length; i++) transactions.push(log.get(i));
+    const replayed = await Ledger.#replay(transactions);
+    replayed.attachLog(log);
+    return replayed;
+  }
+
+  // Mirrors every new record to the log before the caller returns. A failed write must discard this ledger.
+  attachLog(log) {
+    if (this.#log !== null) throw new LedgerError("LOG_ALREADY_ATTACHED", "السجل مرتبط بالفعل بسجل آخر.");
+    if (log.length !== this.#transactions.length) {
+      throw new LedgerError("LOG_MISMATCH", "طول السجل المحفوظ لا يطابق الدفتر.");
+    }
+    this.#log = log;
+  }
+
+  // Rebuilds the ledger by replaying every transaction, verifying each signature and nonce.
+  // Throws LEDGER_CORRUPT if the stored state cannot be reproduced exactly.
+  static async fromSnapshot(snapshot) {
+    if (!isPlainObject(snapshot) || !Array.isArray(snapshot.transactions)) {
+      throw corrupt("شكل السجل غير صالح.");
+    }
+    if (!isPlainObject(snapshot.balances) || !isPlainObject(snapshot.nonces)) {
+      throw corrupt("الأرصدة أو الأرقام التسلسلية غير صالحة.");
+    }
+    for (const [address, units] of Object.entries(snapshot.balances)) {
+      if (!isValidAddress(address) || !DIGITS_PATTERN.test(String(units))) throw corrupt("رصيد غير صالح.");
+    }
+    for (const [address, n] of Object.entries(snapshot.nonces)) {
+      if (!isValidAddress(address) || !Number.isSafeInteger(n) || n < 0) throw corrupt("رقم تسلسلي غير صالح.");
+    }
+
+    const replayed = await Ledger.#replay(snapshot.transactions);
     if (canonicalState(replayed.toJSON()) !== canonicalState(snapshot)) {
       throw corrupt("الأرصدة لا تطابق المعاملات المسجلة.");
     }
@@ -242,11 +302,74 @@ export class Ledger {
     this.#balances.set(from, senderBalance - units);
     this.#balances.set(to, this.balanceOf(to) + units);
     this.#nonces.set(from, expected + 1);
+    this.#sealed = true;
     return this.#record({ type: "transfer", from, to, amount: units, nonce: expected, publicKey, signature });
+  }
+
+  // Initial supply of a new chain, minted once before any transfer or protocol move. Not available afterwards.
+  genesisMint(address, units) {
+    if (!isValidAddress(address)) throw new LedgerError("INVALID_RECIPIENT", "عنوان التأسيس غير صالح.");
+    if (typeof units !== "bigint" || units <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ التأسيس غير صالح.");
+    if (this.#sealed) throw new LedgerError("LEDGER_SEALED", "لا يمكن إنشاء وحدات بعد بدء الحركة على السلسلة.");
+    this.#balances.set(address, this.balanceOf(address) + units);
+    return this.#record({ type: "genesis", from: null, to: address, amount: units, nonce: null, publicKey: null, signature: null });
+  }
+
+  // Protocol move between accounts without a signature: fee, reward, issuance, or burn (to === null).
+  // Checks funds exactly like a transfer. Never creates units.
+  // Post-emission issuance. Only the chain calls this, after checking the cap and the target. Never exposed to users.
+  issue(address, units) {
+    if (!isValidAddress(address)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الإصدار غير صالح.");
+    if (typeof units !== "bigint" || units <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ الإصدار يجب أن يكون أكبر من صفر.");
+    this.#balances.set(address, this.balanceOf(address) + units);
+    this.#sealed = true;
+    return this.#record({ type: "issue", from: null, to: address, amount: units, nonce: null, publicKey: null, signature: null });
+  }
+
+  // Sum of balances, leaving out the listed accounts. Used for the circulating base of the issuance cap.
+  totalBalance(exclude = []) {
+    const skip = new Set(exclude);
+    let sum = 0n;
+    for (const [address, units] of this.#balances) {
+      if (!skip.has(address)) sum += units;
+    }
+    return sum;
+  }
+
+  protocolMove({ from, to, amount, withdrawalId }) {
+    if (!isValidAddress(from)) throw new LedgerError("INVALID_SENDER", "عنوان الحركة غير صالح.");
+    if (withdrawalId !== undefined) {
+      if (!Number.isSafeInteger(withdrawalId) || withdrawalId <= 0) throw new LedgerError("INVALID_WITHDRAWAL", "رقم السحب غير صالح.");
+      if (this.#withdrawals.has(withdrawalId)) throw new LedgerError("WITHDRAWAL_REPLAY", "هذا السحب نُفّذ بالفعل.");
+    }
+    if (to !== null && !isValidAddress(to)) throw new LedgerError("INVALID_RECIPIENT", "عنوان الحركة غير صالح.");
+    if (typeof amount !== "bigint" || amount <= 0n) throw new LedgerError("INVALID_AMOUNT", "مبلغ الحركة يجب أن يكون أكبر من صفر.");
+    const balance = this.balanceOf(from);
+    if (balance < amount) throw new LedgerError("INSUFFICIENT_FUNDS", "الرصيد غير كافٍ لحركة البروتوكول.");
+    this.#balances.set(from, balance - amount);
+    if (to !== null) this.#balances.set(to, this.balanceOf(to) + amount);
+    this.#sealed = true;
+    if (withdrawalId !== undefined) this.#withdrawals.add(withdrawalId);
+    return this.#record({
+      type: "protocol",
+      from,
+      to,
+      amount,
+      nonce: null,
+      publicKey: null,
+      signature: null,
+      ...(withdrawalId !== undefined ? { withdrawalId } : {}),
+    });
+  }
+
+  hasWithdrawal(withdrawalId) {
+    return this.#withdrawals.has(withdrawalId);
   }
 
   #record(tx) {
     const entry = { height: this.#transactions.length + 1, ...tx };
+    // The log stores plain JSON: amounts go down as decimal strings, as they are in snapshots.
+    if (this.#log !== null) this.#log.append({ ...entry, amount: String(entry.amount) });
     this.#transactions.push(entry);
     return { ...entry };
   }

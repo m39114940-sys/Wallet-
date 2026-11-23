@@ -108,3 +108,58 @@ test("a stored ledger reloads exactly when its records are intact", async () => 
   assert.equal(restored.nextNonce(alice.address), 1);
   assert.equal(restored.height, 2);
 });
+
+test("a snapshot keeps treasury withdrawal ids and refuses a replayed id on reload", async () => {
+  const { Ledger: L } = await import("../js/ledger.js");
+  const mint = "snn1" + "b".repeat(40);
+  const dest = "snn1" + "c".repeat(40);
+  const ledger = new L();
+  ledger.genesisMint(mint, 1_000n);
+  ledger.protocolMove({ from: mint, to: dest, amount: 50n, withdrawalId: 3 });
+  const copy = await L.fromSnapshot(JSON.parse(JSON.stringify(ledger.toJSON())));
+  assert.equal(copy.hasWithdrawal(3), true);
+  const forged = JSON.parse(JSON.stringify(ledger.toJSON()));
+  forged.transactions.push({ ...forged.transactions[1], height: 3 });
+  await assert.rejects(L.fromSnapshot(forged));
+});
+
+test("the ledger mirrors every record to its log and rebuilds from it", async () => {
+  const { RecordLog } = await import("../js/record-log.js");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "snn-ledger-log-"));
+  try {
+    const mint = "snn1" + "d".repeat(40);
+    const dest = "snn1" + "e".repeat(40);
+    const log = new RecordLog(dir, { segmentRecords: 2 });
+    const ledger = new Ledger();
+    ledger.attachLog(log);
+    ledger.genesisMint(mint, 1_000n);
+    ledger.protocolMove({ from: mint, to: dest, amount: 25n });
+    ledger.protocolMove({ from: dest, to: null, amount: 5n });
+    assert.equal(log.length, 3);
+    const rebuilt = await Ledger.fromLog(new RecordLog(dir, { segmentRecords: 2 }));
+    assert.equal(rebuilt.balanceOf(mint), 975n);
+    assert.equal(rebuilt.balanceOf(dest), 20n);
+    assert.equal(rebuilt.height, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a log that does not match the ledger height is refused", async () => {
+  const { RecordLog } = await import("../js/record-log.js");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "snn-ledger-mismatch-"));
+  try {
+    const log = new RecordLog(dir);
+    log.append({ type: "genesis" });
+    const ledger = new Ledger(); // height 0, the log holds one record
+    assert.throws(() => ledger.attachLog(log), { code: "LOG_MISMATCH" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

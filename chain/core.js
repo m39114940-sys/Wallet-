@@ -6,9 +6,18 @@
 // Stakes and weights are integers (micro-SNN units), so slashing and quorum use exact arithmetic.
 
 import { validateWork, mine, nextTarget, PowError } from "./pow.js";
-import { Ledger, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
+import { Ledger, LedgerError, TESTNET_FAUCET_UNITS, parseAmount, formatAmount } from "../js/ledger.js";
 import { capWeights, DEFAULT_MAX_SHARE_BPS, hasQuorum, sumOf } from "./weights.js";
 import { sha256Hex, canonicalJson, verifyText } from "./crypto.js";
+import { compositeStateRoot } from "./stateroot.js";
+import { EvmAccounts } from "../evm/state.js";
+import { applyTransferEntry } from "../evm/transfer.js";
+import { EVM_CHAIN_IDS } from "../evm/params.js";
+import { EvmError } from "../evm/errors.js";
+import { validateParams, feeForUtilisation, splitFee, issuanceFor, BPS_DENOMINATOR, EconError } from "../econ/rules.js";
+import { addressFromPublicKey, fromHex } from "../js/signing.js";
+import { validateTreasuryConfig, verifyWithdrawalBundle, applyWithdrawal, TreasuryError } from "../econ/treasury.js";
+import { isValidAddress } from "../js/ledger.js";
 
 export const GENESIS_PREV_HASH = "0".repeat(64);
 export const SLASH_PERCENT = 5n; // double signing burns 5% of the stake and jails the validator
@@ -31,8 +40,33 @@ export class ChainError extends Error {
 
 // Only these fields exist in a transaction. Amounts are rewritten to one canonical decimal form,
 // so "2.5" and "2.50" cannot produce two different transaction ids for the same transfer.
+export const WITHDRAWAL_TYPE = "treasury-withdraw";
+export const isWithdrawal = (tx) => tx !== null && typeof tx === "object" && tx.type === WITHDRAWAL_TYPE;
+
+// Treasury withdrawal: carries the proposal and its signer approvals. Verified in applyTreasuryWithdrawal.
+function normalizeWithdrawal(tx) {
+  if (!Number.isSafeInteger(tx.id) || tx.id <= 0) throw new ChainError("BAD_TX", "رقم السحب غير صالح.");
+  if (typeof tx.to !== "string") throw new ChainError("BAD_TX", "مستلم السحب مطلوب.");
+  if (typeof tx.units !== "string" || !/^[1-9][0-9]*$/.test(tx.units)) throw new ChainError("BAD_TX", "مبلغ السحب غير صالح.");
+  if (!Number.isSafeInteger(tx.proposedAt) || !Number.isSafeInteger(tx.executeAfter)) throw new ChainError("BAD_TX", "ارتفاعات السحب غير صالحة.");
+  if (!Array.isArray(tx.approvals)) throw new ChainError("BAD_TX", "قائمة موافقات السحب مطلوبة.");
+  return {
+    type: WITHDRAWAL_TYPE,
+    id: tx.id,
+    to: tx.to,
+    units: tx.units,
+    proposedAt: tx.proposedAt,
+    executeAfter: tx.executeAfter,
+    approvals: tx.approvals.map((a) => {
+      if (a === null || typeof a !== "object") throw new ChainError("BAD_TX", "موافقة السحب غير صالحة.");
+      return { signer: a.signer, signature: a.signature };
+    }),
+  };
+}
+
 export function normalizeTx(tx) {
   if (tx === null || typeof tx !== "object") throw new ChainError("BAD_TX", "المعاملة غير صالحة.");
+  if (isWithdrawal(tx)) return normalizeWithdrawal(tx);
   return {
     from: tx.from,
     to: tx.to,
@@ -114,7 +148,7 @@ export async function verifyEvidence(evRaw, chainId, state) {
 // rules: optional. Absent means the current Testnet rules, and the key is then not written at all, so
 // existing Testnet genesis hashes do not change. 'hybrid-v1' adds the proof-of-work check (see docs/hybrid-consensus.md).
 // powTarget: hex target for 'hybrid-v1' blocks. Fixed for now; difficulty retargeting is not wired in yet.
-export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs }) {
+export function createGenesisConfig({ chainId, timestamp, allocations, validators, maxShareBps = DEFAULT_MAX_SHARE_BPS, rules, powTarget, powRetargetWindow, powBlockTimeMs, stateRootV1, evmChainId, evmAllocations, economics }) {
   const config = {
     chainId,
     timestamp,
@@ -128,10 +162,29 @@ export function createGenesisConfig({ chainId, timestamp, allocations, validator
   if (powTarget !== undefined) config.powTarget = powTarget;
   if (powRetargetWindow !== undefined) config.powRetargetWindow = powRetargetWindow;
   if (powBlockTimeMs !== undefined) config.powBlockTimeMs = powBlockTimeMs;
+  if (stateRootV1 !== undefined) config.stateRootV1 = stateRootV1;
+  if (evmChainId !== undefined) config.evmChainId = evmChainId;
+  if (evmAllocations !== undefined) config.evmAllocations = evmAllocations;
+  if (economics !== undefined) config.economics = economics;
   return config;
 }
 
 export const RULES_HYBRID = "hybrid-v1";
+
+// Fields of one EVM transfer entry in a block. Nothing else is allowed, so the block hash cannot carry extra data.
+export const EVM_ENTRY_FIELDS = ["gasLimit", "nonce", "r", "s", "to", "v", "value"];
+
+// Chain id used for EVM signatures on this chain. The Testnet value applies when the genesis names none.
+export const evmChainIdOf = (config) => config.evmChainId ?? Number(EVM_CHAIN_IDS.testnet);
+
+// Strict shape check for one EVM entry, shared by the block rules and the node's mempool.
+export function checkEvmEntryShape(entry) {
+  if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== EVM_ENTRY_FIELDS.join()) {
+    throw new ChainError("BAD_EVM_TX", "حقول معاملة EVM غير مسموحة.");
+  }
+}
+
+export const evmEntryId = (entry) => sha256Hex(canonicalJson(entry));
 
 export function validateGenesis(config) {
   const bad = (msg) => new ChainError("BAD_GENESIS", msg);
@@ -152,6 +205,30 @@ export function validateGenesis(config) {
     }
   } else if (config.powTarget !== undefined || config.powRetargetWindow !== undefined || config.powBlockTimeMs !== undefined) {
     throw bad("هدف إثبات العمل يُستخدم فقط مع قواعد hybrid-v1.");
+  }
+  if (config.stateRootV1 !== undefined) {
+    if (config.stateRootV1 !== true || config.rules !== RULES_HYBRID) {
+      throw bad("جذر الحالة يتطلب قواعد hybrid-v1 ويُفعَّل بالقيمة true فقط.");
+    }
+  }
+  const evmConfigured = config.evmChainId !== undefined || config.evmAllocations !== undefined;
+  if (evmConfigured && config.stateRootV1 !== true) {
+    throw bad("إعدادات EVM تتطلب جذر الحالة (stateRootV1) على سلسلة جديدة.");
+  }
+  if (config.evmChainId !== undefined && (!Number.isSafeInteger(config.evmChainId) || config.evmChainId <= 0)) {
+    throw bad("معرّف سلسلة EVM غير صالح.");
+  }
+  if (config.evmAllocations !== undefined) {
+    try {
+      EvmAccounts.fromAllocations(config.evmAllocations);
+    } catch (err) {
+      throw bad(`تخصيصات EVM غير صالحة: ${err.message}`);
+    }
+  }
+  if (config.economics !== undefined) {
+    if (config.stateRootV1 !== true) throw bad("الاقتصاد يتطلب جذر الحالة (stateRootV1) على سلسلة جديدة.");
+    if (config.allocations.length !== 0) throw bad("سلسلة الاقتصاد لا تستخدم صنبور التأسيس (allocations يجب أن تكون فارغة).");
+    validateEconomics(config.economics, bad, config);
   }
   const seen = new Set();
   for (const v of config.validators) {
@@ -190,16 +267,279 @@ export function genesisState(config) {
     ledger.credit(address, TESTNET_FAUCET_UNITS);
   }
   const stakes = new Map(config.validators.map((v) => [v.publicKey, BigInt(v.stake)]));
-  return { ledger, stakes, jailed: new Set() };
+  const state = { ledger, stakes, jailed: new Set() };
+  // EVM accounts exist only on chains with stateRootV1. Their genesis funding is separate from the SNN allocations.
+  if (config.stateRootV1 === true) state.evm = EvmAccounts.fromAllocations(config.evmAllocations ?? {});
+  if (config.economics !== undefined) {
+    // The whole supply is minted once at genesis, per allocation. Locks apply afterwards, by vesting rule.
+    for (const a of config.economics.genesisAllocations) ledger.genesisMint(a.address, BigInt(a.units));
+  }
+  return state;
 }
 
 // ---------- State and validator set ----------
+
+// ---------- Economics: fees, validator shares and issuance (only on chains whose genesis names `economics`) ----------
+// Values are strings in genesis so the config stays canonical JSON. Rules are in econ/rules.js.
+// Fee for a block comes from the PARENT block's fullness, so every node knows it before building the block.
+// Fees are paid into feeAddress and fully distributed in the same block, leaving feeAddress at zero.
+
+const DECIMAL = /^(0|[1-9][0-9]{0,30})$/;
+
+// Total supply, fixed by the decision document: 100,000,000 SNN in micro-units.
+export const ECON_MAX_SUPPLY = 100_000_000n * 1_000_000n;
+
+function validateEconomics(e, bad, config) {
+  if (e === null || typeof e !== "object") throw bad("إعدادات الاقتصاد غير صالحة.");
+  const digits = (value, name) => {
+    if (typeof value !== "string" || !DECIMAL.test(value)) throw bad(`${name} يجب أن يكون عدداً صحيحاً كنص.`);
+    return value;
+  };
+  const params = economicsParamsOf(e, bad);
+  if (e.treasury !== undefined) {
+    try {
+      validateTreasuryConfig(e.treasury);
+    } catch (err) {
+      throw bad(`إعدادات الخزينة غير صالحة: ${err.message}`);
+    }
+  }
+  try {
+    validateParams(params);
+  } catch (err) {
+    if (err instanceof EconError) throw bad(err.message);
+    throw err;
+  }
+  if (BigInt(digits(e.blockCapacity, "سعة الكتلة")) === 0n) throw bad("سعة الكتلة يجب أن تكون أكبر من صفر.");
+  if (BigInt(digits(e.blocksPerPeriod, "عدد الكتل لكل فترة")) === 0n) throw bad("عدد الكتل لكل فترة يجب أن يكون أكبر من صفر.");
+  digits(e.securityTargetPerPeriod, "هدف الإصدار لكل فترة");
+  // Post-emission rules: after `emissionBlocks` the reward target continues, funded by fees first, then by capped issuance.
+  digits(e.emissionBlocks, "عدد كتل الإصدار");
+  if (BigInt(digits(e.periodsPerYear, "عدد الفترات في السنة")) === 0n) throw bad("عدد الفترات في السنة يجب أن يكون أكبر من صفر.");
+  digits(e.postTargetPerPeriod, "هدف ما بعد الإصدار لكل فترة");
+  if (BigInt(digits(e.postCapBps, "سقف الإصدار بعد الإصدار الأولي")) > 10_000n) {
+    throw bad("سقف الإصدار بعد الإصدار الأولي يجب ألا يتجاوز 10000 نقطة أساس.");
+  }
+  for (const name of ["feeAddress", "treasuryAddress", "poolAddress"]) {
+    if (!isValidAddress(e[name])) throw bad(`عنوان ${name} غير صالح.`);
+  }
+  const addresses = new Set([e.feeAddress, e.treasuryAddress, e.poolAddress]);
+  if (addresses.size !== 3) throw bad("حسابات الرسوم والخزينة والمجمع يجب أن تكون مختلفة.");
+  // Genesis allocations: the whole supply, each entry with an explicit vesting rule. Nothing defaults.
+  if (!Array.isArray(e.genesisAllocations) || e.genesisAllocations.length === 0) throw bad("توزيع التأسيس مطلوب.");
+  const seenAddresses = new Set();
+  let total = 0n;
+  for (const a of e.genesisAllocations) {
+    if (a === null || typeof a !== "object") throw bad("عنصر توزيع التأسيس غير صالح.");
+    if (!isValidAddress(a.address)) throw bad("عنوان في توزيع التأسيس غير صالح.");
+    if (seenAddresses.has(a.address)) throw bad("عنوان مكرر في توزيع التأسيس.");
+    seenAddresses.add(a.address);
+    const units = BigInt(digits(a.units, "مبلغ التوزيع"));
+    if (units === 0n) throw bad("مبلغ التوزيع يجب أن يكون أكبر من صفر.");
+    total += units;
+    if (a.vesting === null || typeof a.vesting !== "object") throw bad("قاعدة الاستحقاق مطلوبة لكل توزيع.");
+    digits(a.vesting.cliffBlocks, "مدة الانتظار");
+    digits(a.vesting.durationBlocks, "مدة التحرير");
+    if (BigInt(digits(a.vesting.cliffReleaseBps, "نسبة التحرير عند الانتظار")) > BPS_DENOMINATOR) {
+      throw bad("نسبة التحرير عند الانتظار يجب ألا تتجاوز 10000 نقطة أساس.");
+    }
+  }
+  if (total !== ECON_MAX_SUPPLY) throw bad("مجموع التوزيع يجب أن يساوي المعروض الأقصى بالضبط.");
+  const pool = e.genesisAllocations.find((a) => a.address === e.poolAddress);
+  if (pool === undefined || BigInt(pool.units) !== BigInt(e.issuancePool)) {
+    throw bad("حساب المجمع يجب أن يُمنح في التوزيع بمبلغ مجمع الإصدار بالضبط.");
+  }
+  if (seenAddresses.has(e.feeAddress)) throw bad("حساب الرسوم لا يُمنح في التوزيع.");
+}
+
+// Vesting: an allocation is locked until its schedule releases it. Locked units stay owned by the account and are never burned.
+// Release: nothing before cliffBlocks; then cliffReleaseBps at the cliff; the rest linearly over durationBlocks (0 = at once).
+export function vestingOf(config) {
+  const out = new Map();
+  if (config.economics === undefined) return out;
+  for (const a of config.economics.genesisAllocations) {
+    out.set(a.address, {
+      units: BigInt(a.units),
+      cliff: BigInt(a.vesting.cliffBlocks),
+      cliffBps: BigInt(a.vesting.cliffReleaseBps),
+      duration: BigInt(a.vesting.durationBlocks),
+    });
+  }
+  return out;
+}
+
+// Units still locked for one vesting entry at a block height.
+export function lockedAt(entry, height) {
+  const h = BigInt(height);
+  if (h < entry.cliff) return entry.units;
+  const cliffPart = (entry.units * entry.cliffBps) / BPS_DENOMINATOR;
+  const rest = entry.units - cliffPart;
+  const elapsed = h - entry.cliff;
+  const linear = elapsed >= entry.duration ? rest : (rest * elapsed) / entry.duration;
+  return entry.units - (cliffPart + linear);
+}
+
+// Total locked at a height, leaving out the listed accounts.
+export function lockedTotal(config, height, exclude = []) {
+  const skip = new Set(exclude);
+  let sum = 0n;
+  for (const [address, entry] of vestingOf(config)) {
+    if (!skip.has(address)) sum += lockedAt(entry, height);
+  }
+  return sum;
+}
+
+// Converts the genesis strings into the integer parameters used by econ/rules.js.
+export function economicsParamsOf(e, bad = (msg) => new ChainError("BAD_GENESIS", msg)) {
+  const num = (value) => {
+    if (typeof value !== "string" || !DECIMAL.test(value)) throw bad("قيمة اقتصادية غير صالحة.");
+    return BigInt(value);
+  };
+  return {
+    feeTiers: { quiet: num(e.feeTiers?.quiet), normal: num(e.feeTiers?.normal), congested: num(e.feeTiers?.congested) },
+    tierThresholdsBps: { normal: num(e.tierThresholdsBps?.normal), congested: num(e.tierThresholdsBps?.congested) },
+    feeSplitBps: {
+      validators: num(e.feeSplitBps?.validators),
+      securityTreasury: num(e.feeSplitBps?.securityTreasury),
+      burn: num(e.feeSplitBps?.burn),
+    },
+    issuancePool: num(e.issuancePool),
+  };
+}
+
+// Fee per transaction for the block that follows `parent`. Zero on chains without economics.
+export function feeOf(parent, config) {
+  const e = config.economics;
+  if (e === undefined) return 0n;
+  const util = (BigInt(parent.txs.length) * BPS_DENOMINATOR) / BigInt(e.blockCapacity);
+  return feeForUtilisation(util, economicsParamsOf(e));
+}
+
+// Applies one user transfer and, on economics chains, moves its fee to feeAddress. Callers discard the state on error.
+export async function applyUserTx(state, tx, config, fee, height) {
+  if (isWithdrawal(tx)) return applyTreasuryWithdrawal(state, tx, config, height);
+  if (config.economics !== undefined) {
+    // Only the available part of a balance can be spent: balance minus what is still locked at this height.
+    const entry = vestingOf(config).get(tx.from);
+    const locked = entry === undefined ? 0n : lockedAt(entry, height);
+    const amount = parseAmount(tx.amount);
+    if (state.ledger.balanceOf(tx.from) - locked < amount + fee) {
+      throw new ChainError("LOCKED_FUNDS", "الرصيد المتاح غير كافٍ بسبب أقفال الاستحقاق.");
+    }
+  }
+  await state.ledger.transfer(tx);
+  if (config.economics !== undefined && fee > 0n) {
+    state.ledger.protocolMove({ from: tx.from, to: config.economics.feeAddress, amount: fee });
+  }
+}
+
+// Splits `amount` among the parent block's certificate signers, by their weight at the current state.
+// Signers with no weight now (for example, jailed in the parent block) receive nothing. With no recipients, the
+// amount goes to the treasury. Remainder units go to the first signer in sorted order, so the split is exact.
+async function recipientsFor(parent, state, config, amount) {
+  if (amount === 0n) return [];
+  const signers = [...new Set((parent.certificate?.signatures ?? []).map((s) => s.validator))].sort();
+  const { weights } = validatorWeights(state, config.maxShareBps);
+  const weighted = signers.map((key) => ({ key, weight: weights.get(key) ?? 0n })).filter((x) => x.weight > 0n);
+  const total = weighted.reduce((sum, x) => sum + x.weight, 0n);
+  if (total === 0n) return [{ address: config.economics.treasuryAddress, units: amount }];
+  const out = weighted.map((x) => ({ key: x.key, units: (amount * x.weight) / total }));
+  out[0].units += amount - out.reduce((sum, x) => sum + x.units, 0n);
+  const result = [];
+  for (const x of out) {
+    if (x.units > 0n) result.push({ address: await addressFromPublicKey(fromHex(x.key)), units: x.units });
+  }
+  return result;
+}
+
+async function settleEconomics(next, block, parent, state, config, fee) {
+  const e = config.economics;
+  const params = economicsParamsOf(e);
+  try {
+    // Withdrawals pay no user fee, so only transfers count toward the fee pool.
+    const feePayers = block.txs.filter((t) => !isWithdrawal(t)).length;
+    const feesTotal = fee * BigInt(feePayers);
+    const split = splitFee(feesTotal, params.feeSplitBps);
+    // Validator share, then issuance. Both go to the parent's certificate signers. Without signers, the treasury gets them.
+    const post = BigInt(block.height) > BigInt(e.emissionBlocks);
+    const perPeriod = BigInt(post ? e.postTargetPerPeriod : e.securityTargetPerPeriod);
+    const i = BigInt(block.height) % BigInt(e.blocksPerPeriod);
+    const target = (((i + 1n) * perPeriod) / BigInt(e.blocksPerPeriod)) -
+      ((i * perPeriod) / BigInt(e.blocksPerPeriod));
+    let issuance;
+    if (!post) {
+      // Emission period: paid from the pool, topping validator income up to the target.
+      issuance = issuanceFor({
+        validatorFeeShare: split.validators,
+        target,
+        pool: next.ledger.balanceOf(e.poolAddress),
+      }).issuance;
+    } else {
+      // After emission: new units, the shortfall after fees, capped at postCapBps of circulating supply per year.
+      // Circulating = balances except pool, treasury and fee account, minus what is still locked. Taken before this block.
+      const excluded = [e.poolAddress, e.treasuryAddress, e.feeAddress];
+      const circulating = state.ledger.totalBalance(excluded) - lockedTotal(config, block.height, excluded);
+      const blocksPerYear = BigInt(e.periodsPerYear) * BigInt(e.blocksPerPeriod);
+      const cap = (circulating * BigInt(e.postCapBps)) / (BPS_DENOMINATOR * blocksPerYear);
+      const shortfall = target > split.validators ? target - split.validators : 0n;
+      issuance = shortfall < cap ? shortfall : cap;
+    }
+    // recipientsFor always sums to the amount it was given, so the validator share is paid exactly.
+    for (const r of await recipientsFor(parent, state, config, split.validators)) {
+      next.ledger.protocolMove({ from: e.feeAddress, to: r.address, amount: r.units });
+    }
+    if (split.securityTreasury > 0n) {
+      next.ledger.protocolMove({ from: e.feeAddress, to: e.treasuryAddress, amount: split.securityTreasury });
+    }
+    if (split.burn > 0n) next.ledger.protocolMove({ from: e.feeAddress, to: null, amount: split.burn });
+    for (const r of await recipientsFor(parent, state, config, issuance)) {
+      if (post) next.ledger.issue(r.address, r.units);
+      else next.ledger.protocolMove({ from: e.poolAddress, to: r.address, amount: r.units });
+    }
+    if (next.ledger.balanceOf(e.feeAddress) !== 0n) throw new Error("حساب الرسوم لم يُفرَّغ بالكامل.");
+  } catch (err) {
+    if (err instanceof ChainError) throw err;
+    throw new ChainError("BAD_ECONOMICS", `تسوية الاقتصاد غير صالحة: ${err.message}`);
+  }
+}
+
+// Applies an approved treasury withdrawal. Refused unless the bundle verifies, the id is new, and the
+// amount fits the treasury's spendable balance. Withdrawals pay no user fee.
+async function applyTreasuryWithdrawal(state, tx, config, height) {
+  const e = config.economics;
+  if (e === undefined || e.treasury === undefined) throw new ChainError("BAD_TX", "السحب من الخزينة غير مفعّل في هذه السلسلة.");
+  if (state.ledger.hasWithdrawal(tx.id)) throw new ChainError("WITHDRAWAL_REPLAY", "هذا السحب نُفّذ بالفعل.");
+  const units = BigInt(tx.units);
+  try {
+    await verifyWithdrawalBundle({
+      config: e.treasury,
+      id: tx.id,
+      to: tx.to,
+      units,
+      proposedAt: tx.proposedAt,
+      executeAfter: tx.executeAfter,
+      height,
+      approvals: tx.approvals,
+    });
+    const entry = vestingOf(config).get(e.treasuryAddress);
+    const lockedUnits = entry === undefined ? 0n : lockedAt(entry, height);
+    applyWithdrawal(state.ledger, {
+      treasuryAddress: e.treasuryAddress,
+      lockedUnits,
+      instruction: { to: tx.to, units },
+      withdrawalId: tx.id,
+    });
+  } catch (err) {
+    if (err instanceof TreasuryError || err instanceof LedgerError) throw new ChainError(err.code, err.message);
+    throw err;
+  }
+}
 
 export async function cloneState(state) {
   return {
     ledger: await Ledger.fromSnapshot(JSON.parse(JSON.stringify(state.ledger))),
     stakes: new Map(state.stakes),
     jailed: new Set(state.jailed),
+    ...(state.evm !== undefined ? { evm: state.evm.clone() } : {}),
   };
 }
 
@@ -230,15 +570,19 @@ export const blockHashOf = (block) =>
       merkleRoot: block.merkleRoot,
       evidenceRoot: block.evidenceRoot,
       ...(block.work !== undefined ? { work: block.work } : {}),
+      ...(block.stateRoot !== undefined ? { stateRoot: block.stateRoot } : {}),
+      // The Merkle root covers only SNN transactions, so EVM entries must be hashed on their own.
+      ...(block.evmTxs !== undefined ? { evmTxs: block.evmTxs } : {}),
     }),
   );
 
 const evidenceRootOf = (evidence) => merkleRoot(evidence.map((e) => sha256Hex(canonicalJson(e))));
 
 // Builds an unsigned block. Evidence is sorted by key, so the block bytes do not depend on arrival order.
-export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], work }) {
+export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], work, evmTxs }) {
   const normalized = txs.map(normalizeTx);
   const sorted = evidence.map(normalizeEvidence).sort((a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1));
+  if (evmTxs !== undefined && !Array.isArray(evmTxs)) throw new ChainError("BAD_EVM_TX", "حقل معاملات EVM يجب أن يكون قائمة.");
   const block = {
     height,
     timestamp,
@@ -250,6 +594,7 @@ export function buildBlock({ height, timestamp, prevHash, txs, evidence = [], wo
     certificate: null,
   };
   if (work !== undefined) block.work = work;
+  if (evmTxs !== undefined) block.evmTxs = evmTxs.map((entry) => ({ ...entry }));
   block.hash = blockHashOf(block);
   return block;
 }
@@ -351,13 +696,42 @@ export async function verifyCertificate(chainId, parentState, block, maxShareBps
 // Validates one block against its parent and returns the state after it. Throws ChainError on any problem.
 // It never modifies `state`. It does not check the certificate: see applyCommitted for that.
 export async function applyBlock(state, block, parent, config, chain = null) {
+  const next = await applyBlockBody(state, block, parent, config, chain);
+  checkStateRoot(next, block, config);
+  return next;
+}
+
+// Chains with stateRootV1 require a root equal to the state reached after this block.
+// Other chains refuse blocks that carry one, so the current Testnet is unaffected.
+export function checkStateRoot(next, block, config) {
+  if (config.stateRootV1 === true) {
+    if (block.stateRoot !== compositeStateRoot(next.ledger, next.evm.root())) {
+      throw new ChainError("BAD_STATE_ROOT", "جذر الحالة لا يطابق الحالة الناتجة.");
+    }
+  } else if (block.stateRoot !== undefined) {
+    throw new ChainError("BAD_STATE_ROOT", "جذر الحالة غير مسموح في هذه السلسلة.");
+  }
+}
+
+// Producer side: applies the block, records the resulting state root, and recomputes the hash.
+// Call this before withWork, because work and certificates cover the hash.
+export async function attachStateRoot(state, block, parent, config, chain = null) {
+  if (config.stateRootV1 !== true) return block;
+  // Work is attached after this call, so the proof-of-work check is skipped here. applyBlock checks it later.
+  const next = await applyBlockBody(state, block, parent, config, chain, false);
+  const out = { ...block, stateRoot: compositeStateRoot(next.ledger, next.evm.root()) };
+  out.hash = blockHashOf(out);
+  return out;
+}
+
+async function applyBlockBody(state, block, parent, config, chain = null, requireWork = true) {
   if (block === null || typeof block !== "object" || !Array.isArray(block.txs) || !Array.isArray(block.evidence)) {
     throw new ChainError("BAD_BLOCK", "شكل الكتلة غير صالح.");
   }
   if (block.height !== parent.height + 1) throw new ChainError("BAD_HEIGHT", "ارتفاع الكتلة غير متسلسل.");
   if (block.prevHash !== parent.hash) throw new ChainError("BAD_PARENT", "الكتلة لا تشير إلى الكتلة السابقة الصحيحة.");
   if (block.hash !== blockHashOf(block)) throw new ChainError("BAD_HASH", "بصمة الكتلة لا تطابق محتواها.");
-  if (config.rules === RULES_HYBRID) checkBlockWork(block, config, parent, chain);
+  if (config.rules === RULES_HYBRID && requireWork) checkBlockWork(block, config, parent, chain);
   for (const tx of block.txs) {
     if (canonicalJson(tx) !== canonicalJson(normalizeTx(tx))) {
       throw new ChainError("BAD_TX", "المعاملة تحتوي على حقول غير مسموحة.");
@@ -392,11 +766,30 @@ export async function applyBlock(state, block, parent, config, chain = null) {
     next.jailed.add(ev.validator);
   }
 
+  const fee = feeOf(parent, config);
   for (const tx of block.txs) {
     try {
-      await next.ledger.transfer(tx);
+      await applyUserTx(next, tx, config, fee, block.height);
     } catch (err) {
       throw new ChainError("BAD_TX", `معاملة غير صالحة داخل الكتلة: ${err.message}`);
+    }
+  }
+  if (config.economics !== undefined) await settleEconomics(next, block, parent, state, config, fee);
+
+  if (block.evmTxs !== undefined) {
+    if (config.stateRootV1 !== true) throw new ChainError("BAD_EVM_TX", "معاملات EVM غير مسموحة في هذه السلسلة.");
+    if (!Array.isArray(block.evmTxs)) throw new ChainError("BAD_EVM_TX", "حقل معاملات EVM يجب أن يكون قائمة.");
+    // Testnet default when the genesis names no EVM chain id. The id is part of every signature, so a transfer
+    // signed for another chain cannot be replayed here.
+    const evmChainId = evmChainIdOf(config);
+    for (const entry of block.evmTxs) {
+      checkEvmEntryShape(entry);
+      try {
+        applyTransferEntry(next.evm, entry, evmChainId);
+      } catch (err) {
+        if (err instanceof EvmError) throw new ChainError("BAD_EVM_TX", `معاملة EVM غير صالحة داخل الكتلة: ${err.message}`);
+        throw err;
+      }
     }
   }
   return next;

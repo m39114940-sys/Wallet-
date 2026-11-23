@@ -4,8 +4,19 @@
   "description": "Testnet web wallet for SmartNode Network (SNN). Prototype, not for real funds.",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "python3 -m http.server 8080",
-    "test": "node --test tests/ledger.test.js tests/keystore.test.js tests/security.test.js tests/consensus.test.js tests/chain.test.js tests/weights.test.js tests/tls.test.js tests/network.test.js tests/vrf.test.js tests/keyfile.test.js tests/attacks.test.js tests/stress.test.js tests/resend.test.js tests/lossy.test.js tests/pow.test.js tests/identity.test.js tests/separation.test.js tests/hybrid.test.js tests/hybrid-network.test.js tests/retarget.test.js tests/forkchoice.test.js tests/guard.test.js"
+    "test": "node --test --test-concurrency=1 tests/ledger.test.js tests/keystore.test.js tests/security.test.js tests/consensus.test.js tests/chain.test.js tests/weights.test.js tests/tls.test.js tests/network.test.js tests/vrf.test.js tests/keyfile.test.js tests/attacks.test.js tests/stress.test.js tests/resend.test.js tests/lossy.test.js tests/pow.test.js tests/identity.test.js tests/separation.test.js tests/hybrid.test.js tests/hybrid-network.test.js tests/retarget.test.js tests/forkchoice.test.js tests/guard.test.js tests/evm.test.js tests/evm-engine.test.js tests/stateroot.test.js tests/stateroot-chain.test.js tests/stateroot-node.test.js tests/stateroot-determinism.test.js tests/jsonrpc.test.js tests/evm-tx.test.js tests/evm-transfer.test.js tests/evm-chain-transfer.test.js tests/evm-node-producer.test.js tests/jsonrpc-accounts.test.js tests/jsonrpc-sendraw.test.js tests/jsonrpc-estimate.test.js tests/evm-receipts.test.js tests/jsonrpc-call.test.js tests/economics.test.js tests/economics-chain.test.js tests/treasury.test.js tests/model-d.test.js tests/treasury-apply.test.js tests/treasury-bundle.test.js tests/treasury-chain.test.js tests/record-log.test.js tests/node-block-log.test.js"
+  },
+  "dependencies": {
+    "@ethereumjs/common": "10.1.3",
+    "@ethereumjs/evm": "10.1.3",
+    "@ethereumjs/statemanager": "10.1.3",
+    "@ethereumjs/tx": "10.1.3",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
   }
 }

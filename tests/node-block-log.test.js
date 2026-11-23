@@ -71,3 +71,20 @@ test("an unknown storage mode is refused", async () => {
     assert.throws(() => new ChainNode({ dataDir: dir, genesis: g, storage: "sqlite" }), /نوع التخزين/);
   });
 });
+
+test("an interrupted reorg rewrite is recovered: a moved-aside copy comes back, a stray tmp copy is dropped", async () => {
+  await withDir(async (dir, g) => {
+    const node = new ChainNode({ dataDir: dir, genesis: g, storage: "log" });
+    await node.init();
+    const logDir = join(dir, "blocks-log");
+    // Crash after the old copy was moved aside, before the new one was moved in.
+    const { renameSync, mkdirSync } = await import("node:fs");
+    renameSync(logDir, `${logDir}.old`);
+    mkdirSync(`${logDir}.tmp`);
+    node.recoverBlockLog();
+    assert.equal(existsSync(logDir), true);
+    assert.equal(existsSync(`${logDir}.old`), false);
+    assert.equal(existsSync(`${logDir}.tmp`), false);
+    assert.equal(new RecordLog(logDir).length, 1);
+  });
+});

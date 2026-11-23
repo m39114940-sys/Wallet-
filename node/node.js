@@ -135,6 +135,7 @@ export class ChainNode {
   async init() {
     mkdirSync(this.dataDir, { recursive: true });
     const chainPath = join(this.dataDir, "chain.json");
+    if (this.storage === "log") this.recoverBlockLog();
     if (this.storage === "log" && existsSync(join(this.dataDir, BLOCK_LOG_DIR))) {
       this.blockLog = new RecordLog(join(this.dataDir, BLOCK_LOG_DIR));
       const blocks = [];
@@ -165,6 +166,16 @@ export class ChainNode {
     renameSync(tmp, path); // atomic replace on the same filesystem
   }
 
+  // Finishes or discards an interrupted reorg rewrite. A complete tmp copy that was never moved in is dropped;
+  // an old copy left aside without its replacement is moved back, so the last committed log is always the one used.
+  recoverBlockLog() {
+    const dir = join(this.dataDir, BLOCK_LOG_DIR);
+    const old = `${dir}.old`;
+    if (!existsSync(dir) && existsSync(old)) renameSync(old, dir);
+    else if (existsSync(old)) rmSync(old, { recursive: true, force: true });
+    rmSync(`${dir}.tmp`, { recursive: true, force: true });
+  }
+
   // Log mode: append only the blocks not yet logged. If the chain was replaced (a reorg), rewrite the whole log.
   persistLog() {
     const dir = join(this.dataDir, BLOCK_LOG_DIR);
@@ -173,11 +184,15 @@ export class ChainNode {
       (this.loggedCount > 0 && this.blocks[this.loggedCount - 1].hash !== this.loggedHash);
     if (diverged) {
       const tmp = `${dir}.tmp`;
+      const old = `${dir}.old`;
       rmSync(tmp, { recursive: true, force: true });
       const fresh = new RecordLog(tmp);
       for (const block of this.blocks) fresh.append(block);
-      rmSync(dir, { recursive: true, force: true });
-      renameSync(tmp, dir); // the rename is the switch-over point
+      // Move the old copy aside first, so a crash never leaves the directory missing.
+      rmSync(old, { recursive: true, force: true });
+      if (existsSync(dir)) renameSync(dir, old);
+      renameSync(tmp, dir);
+      rmSync(old, { recursive: true, force: true });
       this.blockLog = new RecordLog(dir);
     } else {
       if (this.blockLog === null) this.blockLog = new RecordLog(dir);

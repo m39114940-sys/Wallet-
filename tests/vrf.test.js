@@ -6,13 +6,20 @@ import { vrfProve, vrfVerify, vrfPublicKey } from "../chain/vrf.js";
 const SK = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7";
 const ALPHA = "af82";
 
-// The RFC 9381 Appendix B.3 vector (Example 21) as transcribed from the RFC text. The current
-// implementation does NOT reproduce its pi, so this test is skipped until the discrepancy is resolved.
-// It must not be used as evidence of RFC 9381 conformance while skipped.
-test("RFC 9381 B.3 example 21 (unresolved discrepancy)", { skip: "pi does not match; see SECURITY_ARCHITECTURE.md" }, () => {
+// RFC 9381, Appendix B.3, Example 18 (ECVRF-EDWARDS25519-SHA512-TAI). Values checked against the RFC text.
+// The earlier proof/output were from Example 21 in Appendix B.4 (ELL2), not a mis-transcription.
+test("RFC 9381 B.3 example 18 (ECVRF-EDWARDS25519-SHA512-TAI)", () => {
   const PK = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025";
-  const PI = "926e895d308f5e328e7aa159c06eddbe56d06846abf5d98c2512235eaa57fdce35b46edfc655bc828d44ad09d1150f31374e7ef73027e14760d42e77341fe05467bb286cc2c9d7fde29120a0b2320d04";
-  const BETA = "121b7f9b9aaaa29099fc04a94ba52784d44eac976dd1a3cca458733be5cd090a7b5fbd148444f17f8daf1fb55cb04b1ae85a626e30a54b4b0f8abf4a43314a58";
+  const PI = [
+    "9bc0f79119cc5604bf02d23b4caede71393cedfbb191434dd016d30177ccb",
+    "f8096bb474e53895c362d8628ee9f9ea3c0e52c7a5c691b6c18c9979866568add7",
+    "a2d41b00b05081ed0f58ee5e31b3a970e",
+  ].join("");
+  const BETA = [
+    "645427e5d00c62a23fb703732fa5d892940935942101e456ecca7bb217c",
+    "61c452118fec1219202a0edcf038bb6373241578be7217ba85a2687f7a0310b2df",
+    "19f",
+  ].join("");
   assert.equal(vrfPublicKey(SK), PK);
   assert.equal(vrfProve(SK, ALPHA), PI);
   assert.equal(vrfVerify(PK, ALPHA, PI), BETA);

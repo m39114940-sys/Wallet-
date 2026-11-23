@@ -224,8 +224,9 @@ test("four validators agree on certified blocks, survive a crash, and punish dou
   assert.equal(foreignSync.body.code, "PEER_NOT_ALLOWED");
 
   // 8. A flood from one address is throttled, and the node recovers once the bucket refills.
-  // The bucket holds 400 tokens and refills at 200 per second, so the outcome depends on timing.
-  // Send batches until the limiter refuses, with a fixed upper bound, instead of relying on one burst.
+  // This HTTP integration test cannot guarantee a server-side single burst: Promise.all only starts
+  // client requests concurrently, while TLS setup and scheduling spread arrivals as the 400-token
+  // bucket refills at 200 requests per second. Keep this as sustained pressure, not burst evidence.
   let refused = false;
   for (let batch = 0; batch < 40 && !refused; batch++) {
     const statuses = await Promise.all(

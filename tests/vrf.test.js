@@ -7,7 +7,7 @@ const SK = "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7";
 const ALPHA = "af82";
 
 // RFC 9381, Appendix B.3, Example 18 (ECVRF-EDWARDS25519-SHA512-TAI). Values checked against the RFC text.
-// An earlier version of this file carried a mis-transcribed vector, which looked like an implementation mismatch.
+// The earlier proof/output were from Example 21 in Appendix B.4 (ELL2), not a mis-transcription.
 test("RFC 9381 B.3 example 18 (ECVRF-EDWARDS25519-SHA512-TAI)", () => {
   const PK = "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025";
   const PI = [

@@ -8,7 +8,9 @@
 // - Messages are not retransmitted. Liveness relies on round timeouts and fresh votes.
 // - Each node sends the full chain on sync. There is no pruning or snapshot.
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, rmSync } from "node:fs";
+import { RecordLog } from "../js/record-log.js";
+const BLOCK_LOG_DIR = "blocks-log";
 import { join } from "node:path";
 import http from "node:http";
 import https from "node:https";
@@ -62,7 +64,13 @@ const byEvidenceKey = (a, b) => (evidenceKey(a) < evidenceKey(b) ? -1 : 1);
 
 export class ChainNode {
   // validator: { publicKey, privateKeyDer } or null. A node without a validator key relays and verifies only.
-  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {} }) {
+  // storage: "json" (default, chain.json rewritten on every change) or "log" (blocks appended to blocks-log/).
+  constructor({ dataDir, genesis, validator = null, tlsIdentity = null, nodeIdentity = null, selfUrl = null, roundMs = 1000, lossRate = 0, log = () => {}, storage = "json" }) {
+    if (storage !== "json" && storage !== "log") throw new Error("نوع التخزين غير معروف.");
+    this.storage = storage;
+    this.blockLog = null; // RecordLog of blocks, opened in log mode
+    this.loggedCount = 0; // how many blocks of this.blocks are already in the log
+    this.loggedHash = null; // hash of the last logged block
     this.tlsIdentity = tlsIdentity; // { key, cert } PEM, presented to peers
     this.nodeIdentity = nodeIdentity; // { publicKey, privateKeyDer, nodeId }: Ed25519 identity of this node
     this.handshake = new Handshake({ chainId: genesis.chainId, verifierId: nodeIdentity?.nodeId ?? "none" });
@@ -127,6 +135,16 @@ export class ChainNode {
   async init() {
     mkdirSync(this.dataDir, { recursive: true });
     const chainPath = join(this.dataDir, "chain.json");
+    if (this.storage === "log" && existsSync(join(this.dataDir, BLOCK_LOG_DIR))) {
+      this.blockLog = new RecordLog(join(this.dataDir, BLOCK_LOG_DIR));
+      const blocks = [];
+      for (let i = 1; i <= this.blockLog.length; i++) blocks.push(this.blockLog.get(i));
+      this.state = await replayChain(blocks, this.genesis);
+      this.blocks = blocks;
+      this.loggedCount = blocks.length;
+      this.loggedHash = blocks[blocks.length - 1].hash;
+      return;
+    }
     if (!existsSync(chainPath)) {
       this.blocks = [genesisBlock(this.genesis)];
       this.state = genesisState(this.genesis);
@@ -140,10 +158,33 @@ export class ChainNode {
   }
 
   persist() {
+    if (this.storage === "log") return this.persistLog();
     const path = join(this.dataDir, "chain.json");
     const tmp = `${path}.tmp`;
     writeFileSync(tmp, JSON.stringify({ blocks: this.blocks }));
     renameSync(tmp, path); // atomic replace on the same filesystem
+  }
+
+  // Log mode: append only the blocks not yet logged. If the chain was replaced (a reorg), rewrite the whole log.
+  persistLog() {
+    const dir = join(this.dataDir, BLOCK_LOG_DIR);
+    const diverged =
+      this.loggedCount > this.blocks.length ||
+      (this.loggedCount > 0 && this.blocks[this.loggedCount - 1].hash !== this.loggedHash);
+    if (diverged) {
+      const tmp = `${dir}.tmp`;
+      rmSync(tmp, { recursive: true, force: true });
+      const fresh = new RecordLog(tmp);
+      for (const block of this.blocks) fresh.append(block);
+      rmSync(dir, { recursive: true, force: true });
+      renameSync(tmp, dir); // the rename is the switch-over point
+      this.blockLog = new RecordLog(dir);
+    } else {
+      if (this.blockLog === null) this.blockLog = new RecordLog(dir);
+      for (let i = this.loggedCount; i < this.blocks.length; i++) this.blockLog.append(this.blocks[i]);
+    }
+    this.loggedCount = this.blocks.length;
+    this.loggedHash = this.blocks[this.blocks.length - 1].hash;
   }
 
   get tip() {
